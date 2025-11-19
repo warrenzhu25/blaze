@@ -1345,6 +1345,1185 @@ impl ExecutionPlan for YourOperatorExec {
 }
 ```
 
+## Deep Dive: Expression Conversion Patterns
+
+Understanding expression conversion is critical for implementing new operators. This
+section details how Spark expressions are converted to protobuf messages that the Rust
+engine can execute.
+
+### Expression Conversion Architecture
+
+**File**: `spark-extension/src/main/scala/org/apache/spark/sql/auron/NativeConverters.scala`
+
+The expression converter uses a **three-tier fallback strategy**:
+
+1. **Full native conversion**: Expression and all children convert successfully
+2. **Partial native conversion**: Some children fail, fallback only those children
+3. **UDF wrapper fallback**: Entire expression wraps in SparkUDFWrapper for Spark evaluation
+
+### Supported Expression Categories
+
+#### 1. Column References and Literals
+
+```scala
+// Column reference - uses ExprId in normal mode
+case ar: AttributeReference =>
+  buildExprNode(_.setColumn(
+    pb.PhysicalColumn.newBuilder()
+      .setName(Util.getFieldNameByExprId(ar))
+      .build()))
+
+// Literal - serialized as Arrow IPC bytes
+case e: Literal =>
+  // Converts to Arrow RecordBatch with single value
+  pb.PhysicalExprNode.newBuilder()
+    .setLiteral(pb.ScalarValue.newBuilder()
+      .setIpcBytes(ByteString.copyFrom(ipcBytes)))
+```
+
+**Key points**:
+- Columns use ExprId-based naming (e.g., `c_0`, `c_1`) for unique identification
+- Literals are serialized using Arrow IPC format for type safety
+- Pruning expressions (for file scans) use column names instead of ExprIds
+
+#### 2. Binary Operators
+
+```scala
+case EqualTo(lhs, rhs) => buildBinaryExprNode(lhs, rhs, "Eq")
+case GreaterThan(lhs, rhs) => buildBinaryExprNode(lhs, rhs, "Gt")
+case LessThan(lhs, rhs) => buildBinaryExprNode(lhs, rhs, "Lt")
+case And(lhs, rhs) => buildBinaryExprNode(lhs, rhs, "And")
+case Or(lhs, rhs) => buildBinaryExprNode(lhs, rhs, "Or")
+```
+
+**Supported operators**:
+- Comparison: `Eq`, `NotEq`, `Gt`, `Lt`, `GtEq`, `LtEq`
+- Logical: `And`, `Or`, `Not`
+- Arithmetic: `Plus`, `Minus`, `Multiply`, `Divide`, `Modulo`
+- Bitwise: `BitwiseAnd`, `BitwiseOr`, `BitwiseShiftLeft`, `BitwiseShiftRight`
+
+#### 3. Cast Expressions
+
+```scala
+// Native cast (except timestamp/date)
+case cast: Cast
+    if !Seq(cast.dataType, cast.child.dataType).exists(t =>
+      t.isInstanceOf[TimestampType] || t.isInstanceOf[DateType]) =>
+  buildExprNode(_.setTryCast(
+    pb.PhysicalTryCastNode.newBuilder()
+      .setExpr(convertExprWithFallback(cast.child, ...))
+      .setArrowType(convertDataType(cast.dataType))
+      .build()))
+```
+
+**Important notes**:
+- Timestamp/Date casts fall back to Spark (different semantics)
+- Use `TryCast` (returns null on failure) instead of `Cast` (throws exception)
+- String-to-numeric casts can optionally trim whitespace via config
+
+#### 4. Aggregate Expressions
+
+```scala
+case e: Max =>
+  aggBuilder.setAggFunction(pb.AggFunction.MAX)
+  aggBuilder.addChildren(convertExpr(e.child))
+
+case Count(children) if !children.exists(_.nullable) =>
+  aggBuilder.setAggFunction(pb.AggFunction.COUNT)
+  aggBuilder.addChildren(convertExpr(Literal.apply(1)))
+```
+
+**Supported aggregates**:
+- Basic: `MAX`, `MIN`, `SUM`, `AVG`, `COUNT`
+- Collection: `COLLECT_LIST`, `COLLECT_SET`
+- Special: `FIRST`, `FIRST_IGNORES_NULL`
+- Brickhouse UDAFs: `BRICKHOUSE_COLLECT`, `BRICKHOUSE_COMBINE_UNIQUE`
+- Fallback: Generic `UDAF` wrapper for unsupported aggregates
+
+#### 5. String Functions
+
+```scala
+case StartsWith(expr, Literal(prefix, StringType)) =>
+  buildExprNode(_.setStringStartsWithExpr(
+    pb.StringStartsWithExprNode.newBuilder()
+      .setExpr(convertExprWithFallback(expr, ...))
+      .setPrefix(prefix.toString)))
+
+case Substring(str, Literal(pos, IntegerType), Literal(len, IntegerType))
+    if pos.asInstanceOf[Int] > 0 && len.asInstanceOf[Int] >= 0 =>
+  buildScalarFunction(
+    pb.ScalarFunction.Substr,
+    str :: Literal(longPos) :: Literal(longLen) :: Nil,
+    StringType)
+```
+
+**Supported string functions**:
+- Search: `StartsWith`, `EndsWith`, `Contains`
+- Manipulation: `Substring`, `Trim`, `Ltrim`, `Rtrim`, `Upper`, `Lower`
+- Combination: `Concat`, `ConcatWs`, `StringRepeat`, `StringSpace`
+- Hash: `MD5`, `SHA2` (224, 256, 384, 512), `Murmur3Hash`, `XxHash64`
+
+#### 6. Case/If Expressions
+
+```scala
+case e @ CaseWhen(branches, elseValue) =>
+  val caseExpr = pb.PhysicalCaseNode.newBuilder()
+  val whenThens = branches.map { case (w, t) =>
+    val casted = t match {
+      case t if t.dataType != e.dataType => Cast(t, e.dataType)
+      case t => t
+    }
+    pb.PhysicalWhenThen.newBuilder()
+      .setWhenExpr(convertExprWithFallback(w, ...))
+      .setThenExpr(convertExprWithFallback(casted, ...))
+      .build()
+  }
+```
+
+**Key features**:
+- Automatic type casting of THEN and ELSE branches
+- `If` expressions convert to `CaseWhen` internally
+- Short-circuit evaluation for Hive UDF conditions
+
+### Expression Conversion Patterns
+
+#### Pattern 1: Type Checking Before Conversion
+
+```scala
+// Good: Check data types before converting
+def scalarTypeSupported(dataType: DataType): Boolean = {
+  dataType match {
+    case NullType | BooleanType | ByteType | ... => true
+    case t: DecimalType if DecimalType.is64BitDecimalType(t) => true
+    case _: DecimalType => false  // Only 64-bit decimal supported
+    case at: ArrayType => scalarTypeSupported(at.elementType)
+    case _ => false
+  }
+}
+```
+
+#### Pattern 2: Pruning vs Normal Mode
+
+```scala
+// Pruning mode (for file scans) - use column names
+case ar: AttributeReference if isPruningExpr =>
+  buildExprNode(_.setColumn(pb.PhysicalColumn.newBuilder().setName(ar.name)))
+
+// Normal mode - use ExprId
+case ar: AttributeReference =>
+  buildExprNode(_.setColumn(
+    pb.PhysicalColumn.newBuilder()
+      .setName(Util.getFieldNameByExprId(ar))
+      .build()))
+```
+
+#### Pattern 3: Fallback Strategy
+
+```scala
+// Try to convert expression
+try {
+  convertExprWithFallback(sparkExpr, isPruningExpr = false, fallbackToError)
+} catch {
+  case e: NotImplementedError =>
+    // Fallback: Wrap in SparkUDFWrapper
+    // 1. Bind convertible children to BoundReferences
+    // 2. Serialize remaining Spark expression
+    // 3. Create UDF wrapper that executes in Spark
+    pb.PhysicalExprNode.newBuilder()
+      .setSparkUdfWrapperExpr(
+        pb.PhysicalSparkUDFWrapperExprNode.newBuilder()
+          .setSerialized(ByteString.copyFrom(serialized))
+          .setReturnType(convertDataType(bound.dataType))
+          .addAllParams(convertedChildren.keys.asJava))
+      .build()
+}
+```
+
+### Common Expression Conversion Issues
+
+#### Issue 1: Decimal Arithmetic
+
+```scala
+// Decimal operations require special handling
+case e: Add if e.dataType.isInstanceOf[DecimalType] =>
+  // Must calculate result precision and scale
+  val resultScale = max(s1, s2)
+  val resultPrecision = max(p1 - s1, p2 - s2) + resultScale + 1
+  val resultType = DecimalType.adjustPrecisionScale(resultPrecision, resultScale)
+
+  // Cast operands to result type, then add
+  buildExprNode {
+    _.setCast(pb.PhysicalCastNode.newBuilder()
+      .setArrowType(convertDataType(resultType))
+      .setExpr(buildExprNode {
+        _.setBinaryExpr(
+          pb.PhysicalBinaryExprNode.newBuilder()
+            .setL(convertExprWithFallback(Cast(lhs, resultType), ...))
+            .setR(convertExprWithFallback(rhs, ...))
+            .setOp("Plus"))
+      }))
+  }
+```
+
+**Enable with**: `spark.auron.decimal.arithOp.enabled=true`
+
+#### Issue 2: Division by Zero
+
+```scala
+// Divide operation must handle zero divisor
+case e: Divide =>
+  buildExprNode {
+    _.setBinaryExpr(
+      pb.PhysicalBinaryExprNode.newBuilder()
+        .setL(convertExprWithFallback(lhs, ...))
+        // Wrap divisor with NullIfZero to return null instead of error
+        .setR(buildExtScalarFunction("NullIfZero", rhs :: Nil, rhs.dataType))
+        .setOp("Divide"))
+  }
+```
+
+#### Issue 3: Subquery Expressions
+
+```scala
+case subquery: ExecSubqueryExpression =>
+  prepareExecSubquery(subquery)  // Ensure subquery is executed
+  val serialized = serializeExpression(subquery, StructType(Nil))
+  buildExprNode {
+    _.setSparkScalarSubqueryWrapperExpr(
+      pb.PhysicalSparkScalarSubqueryWrapperExprNode.newBuilder()
+        .setSerialized(ByteString.copyFrom(serialized))
+        .setReturnType(convertDataType(subquery.dataType)))
+  }
+```
+
+### Data Type Conversion Reference
+
+#### Supported Types
+
+| Spark Type | Arrow Type | Notes |
+|------------|------------|-------|
+| `NullType` | `NONE` | |
+| `BooleanType` | `BOOL` | |
+| `ByteType` | `INT8` | |
+| `ShortType` | `INT16` | |
+| `IntegerType` | `INT32` | |
+| `LongType` | `INT64` | |
+| `FloatType` | `FLOAT32` | |
+| `DoubleType` | `FLOAT64` | |
+| `StringType` | `UTF8` | |
+| `BinaryType` | `BINARY` | |
+| `DateType` | `DATE32` | Days since epoch |
+| `TimestampType` | `TIMESTAMP` | Microseconds, no timezone |
+| `DecimalType` | `DECIMAL` | Only 64-bit (precision ≤ 18) |
+| `ArrayType` | `LIST` | Recursive element type |
+| `MapType` | `MAP` | Recursive key/value types |
+| `StructType` | `STRUCT` | Recursive field types |
+
+#### Unsupported Types
+
+- `CalendarIntervalType` - No Arrow equivalent
+- `DayTimeIntervalType` - Not yet implemented
+- `YearMonthIntervalType` - Not yet implemented
+- Decimal types with precision > 18 (128-bit decimals)
+
+### Best Practices for Expression Conversion
+
+1. **Always validate types**: Use `scalarTypeSupported()` before conversion
+2. **Handle nullability**: Ensure expressions handle null values correctly
+3. **Test with nulls**: Add test cases with NULL values in all positions
+4. **Use helper functions**: `buildExprNode`, `buildBinaryExprNode`, etc.
+5. **Recursive conversion**: Always convert child expressions recursively
+6. **Fallback gracefully**: Let UDF wrapper handle unsupported expressions
+
+## Deep Dive: Partitioning and RDD Dependencies
+
+Understanding partitioning and dependencies is crucial for implementing operators that
+handle data distribution correctly.
+
+### RDD Dependency Types
+
+Auron uses two main dependency types that determine how data flows between partitions:
+
+#### 1. OneToOneDependency (Narrow)
+
+**When to use**:
+- Each output partition depends on exactly one input partition
+- No data shuffling required
+- Examples: Filter, Project, LocalLimit
+
+**Example** (`NativeFilterBase.scala`):
+
+```scala
+override def doExecuteNative(): NativeRDD = {
+  val inputRDD = NativeHelper.executeNative(child)
+  val nativeMetrics = MetricNode(metrics, inputRDD.metrics :: Nil)
+
+  new NativeRDD(
+    sparkContext,
+    nativeMetrics,
+    rddPartitions = inputRDD.partitions,  // Same partitions as input
+    rddPartitioner = inputRDD.partitioner, // Preserve partitioner
+    rddDependencies = new OneToOneDependency(inputRDD) :: Nil,  // 1:1 mapping
+    inputRDD.isShuffleReadFull,
+    (partition, taskContext) => {
+      val inputPartition = inputRDD.partitions(partition.index)
+      // Process partition in place
+      PhysicalPlanNode.newBuilder().setFilter(...).build()
+    },
+    friendlyName = "NativeRDD.Filter")
+}
+```
+
+**Key characteristics**:
+- `rddPartitions = inputRDD.partitions` - Same partition structure
+- `rddPartitioner = inputRDD.partitioner` - Preserve partitioning
+- `new OneToOneDependency(inputRDD)` - Direct partition mapping
+- No network I/O between tasks
+
+#### 2. ShuffleDependency (Wide)
+
+**When to use**:
+- Each output partition depends on multiple input partitions
+- Data must be redistributed across nodes
+- Examples: ShuffleExchange, Aggregate (with grouping), Join
+
+**Example** (`NativeShuffleExchangeBase.scala`):
+
+```scala
+@transient
+lazy val shuffleDependency: ShuffleDependency[Int, InternalRow, InternalRow] = {
+  prepareNativeShuffleDependency(
+    inputRDD,
+    child.output,
+    outputPartitioning,  // New partitioning scheme
+    serializer,
+    metrics)
+}
+
+override def doExecuteNative(): NativeRDD = {
+  val shuffleHandle = shuffleDependency.shuffleHandle
+  val rdd = doExecuteNonNative()
+
+  new NativeRDD(
+    sparkContext,
+    nativeMetrics,
+    rddPartitions = rdd.partitions,      // New partition structure
+    rddPartitioner = rdd.partitioner,     // New partitioner
+    rddDependencies = shuffleDependency :: Nil,  // Shuffle dependency
+    Shims.get.getRDDShuffleReadFull(rdd),
+    (partition, taskContext) => {
+      // Read shuffled data for this partition
+      PhysicalPlanNode.newBuilder()
+        .setIpcReader(buildShuffleReader(...))
+        .build()
+    },
+    friendlyName = "NativeRDD.ShuffleExchange")
+}
+```
+
+**Key characteristics**:
+- `ShuffleDependency` - Network shuffle
+- New partition structure based on partitioning scheme
+- Shuffle read/write metrics tracked separately
+
+### Partitioning Schemes
+
+#### 1. SinglePartition
+
+**Use case**: Aggregate without grouping, GlobalLimit
+
+```scala
+override def outputPartitioning: Partitioning = SinglePartition
+
+// Creates 1 partition containing all data
+PhysicalPlanNode.newBuilder()
+  .setRepartition(
+    PhysicalRepartition.newBuilder()
+      .setSingle(PhysicalSingleRepartition.getDefaultInstance))
+```
+
+#### 2. HashPartitioning
+
+**Use case**: Shuffle for hash aggregation, hash join
+
+```scala
+override def outputPartitioning: Partitioning =
+  HashPartitioning(groupingExpressions, numPartitions)
+
+// Partitions data by hash of grouping expressions
+val nativeHashExprs = expressions.map(expr =>
+  NativeConverters.convertExpr(expr))
+
+PhysicalPlanNode.newBuilder()
+  .setRepartition(
+    PhysicalRepartition.newBuilder()
+      .setHash(
+        PhysicalHashRepartition.newBuilder()
+          .addAllHashExpr(nativeHashExprs.asJava)
+          .setPartitionCount(numPartitions)))
+```
+
+#### 3. RangePartitioning
+
+**Use case**: Sort operations requiring global ordering
+
+```scala
+override def outputPartitioning: Partitioning =
+  RangePartitioning(sortOrder, numPartitions)
+
+// Partitions data by sort key ranges
+val nativeSortExprs = expressions.map { sortOrder =>
+  PhysicalExprNode.newBuilder()
+    .setSort(
+      PhysicalSortExprNode.newBuilder()
+        .setExpr(NativeConverters.convertExpr(sortOrder.child))
+        .setAsc(sortOrder.direction == Ascending)
+        .setNullsFirst(sortOrder.nullOrdering == NullsFirst))
+    .build()
+}
+
+PhysicalPlanNode.newBuilder()
+  .setRepartition(
+    PhysicalRepartition.newBuilder()
+      .setRange(
+        PhysicalRangeRepartition.newBuilder()
+          .addAllExpr(nativeSortExprs.asJava)
+          .setPartitionCount(numPartitions)))
+```
+
+#### 4. RoundRobinPartitioning
+
+**Use case**: Rebalance data evenly without specific key
+
+```scala
+override def outputPartitioning: Partitioning =
+  RoundRobinPartitioning(numPartitions)
+
+// Distributes rows evenly in round-robin fashion
+PhysicalPlanNode.newBuilder()
+  .setRepartition(
+    PhysicalRepartition.newBuilder()
+      .setRoundRobin(
+        PhysicalRoundRobinRepartition.newBuilder()
+          .setPartitionCount(numPartitions)))
+```
+
+**Important**: Not all data types supported (e.g., MapType fails)
+
+### Multi-Input Dependencies (Union)
+
+**Example** (`NativeUnionBase.scala`):
+
+```scala
+override def doExecuteNative(): NativeRDD = {
+  val rdds = children.map(c => NativeHelper.executeNative(c))
+  val unionRDD = sparkContext.union(rdds)
+
+  new NativeRDD(
+    sparkContext,
+    nativeMetrics,
+    unionRDD.partitions,      // Combined partitions
+    unionRDD.partitioner,     // May be None
+    unionRDD.dependencies,    // Multiple RangeDependencies
+    rdds.forall(_.isShuffleReadFull),
+    (partition, taskContext) => {
+      // Determine which child RDD this partition belongs to
+      partition match {
+        case p: UnionPartition[_] =>
+          val nativeRDD = rdds(p.parentRddIndex)
+          val input = nativeRDD.nativePlan(p.parentPartition, taskContext)
+          // Other children get empty partitions
+          UnionExecNode.newBuilder()
+            .addAllInput(unionInputs.asJava)
+            .build()
+      }
+    },
+    friendlyName = "NativeRDD.Union")
+}
+```
+
+### Partition Preservation Patterns
+
+#### Pattern 1: Preserve Input Partitioning
+
+```scala
+// Filter, Project, LocalLimit - maintain input partitioning
+override def outputPartitioning: Partitioning = child.outputPartitioning
+override def outputOrdering: Seq[SortOrder] = child.outputOrdering
+```
+
+#### Pattern 2: Change Partitioning
+
+```scala
+// ShuffleExchange - create new partitioning
+override val outputPartitioning: Partitioning  // From constructor parameter
+
+// Aggregate - depends on grouping keys
+override def outputPartitioning: Partitioning = child.outputPartitioning match {
+  case h: HashPartitioning if h.expressions == groupingExpressions =>
+    h  // Preserve if already hash partitioned on same keys
+  case _ =>
+    UnknownPartitioning(0)  // Otherwise unknown
+}
+```
+
+#### Pattern 3: Require Child Distribution
+
+```scala
+// Aggregate with grouping - requires clustered distribution
+override def requiredChildDistribution: List[Distribution] = {
+  requiredChildDistributionExpressions match {
+    case Some(exprs) if exprs.isEmpty =>
+      AllTuples :: Nil  // Require all data in single partition
+    case Some(exprs) =>
+      ClusteredDistribution(exprs) :: Nil  // Require hash/range partitioning
+    case None =>
+      UnspecifiedDistribution :: Nil  // No requirement
+  }
+}
+```
+
+### Best Practices for Partitioning
+
+1. **Preserve when possible**: Use `child.outputPartitioning` for narrow operations
+2. **Validate partitioner**: Ensure partitioner matches partition count
+3. **Document requirements**: Use `requiredChildDistribution` to specify needs
+4. **Test edge cases**: Empty partitions, single partition, uneven distribution
+5. **Monitor shuffle**: Excessive shuffling indicates partitioning issues
+
+## Deep Dive: Common Patterns and Anti-Patterns
+
+This section highlights proven patterns to follow and common mistakes to avoid when
+implementing new operators.
+
+### Common Patterns (Good Practices)
+
+#### Pattern 1: Always Use `addRenameColumnsExec`
+
+**Why**: Spark uses ExprId-based column names internally (e.g., `c_0`, `c_1`), but native
+operators need consistent naming across plan boundaries.
+
+**Good**:
+```scala
+def convertFilterExec(exec: FilterExec): SparkPlan = {
+  Shims.get.createNativeFilterExec(
+    exec.condition,
+    addRenameColumnsExec(convertToNative(exec.child)))  // ✓ Rename before native op
+}
+```
+
+**Bad**:
+```scala
+def convertFilterExec(exec: FilterExec): SparkPlan = {
+  Shims.get.createNativeFilterExec(
+    exec.condition,
+    convertToNative(exec.child))  // ✗ Missing rename - may cause field mismatches
+}
+```
+
+**When to skip**: Only skip for `NativeShuffleExchange` and operators where the child is
+guaranteed to already have correct naming.
+
+#### Pattern 2: Use `tryConvert` for Error Handling
+
+**Why**: Provides consistent error handling, logging, and fallback to Spark execution.
+
+**Good**:
+```scala
+case e: YourOperatorExec if enableYourOperator =>
+  tryConvert(e, convertYourOperatorExec)  // ✓ Handles exceptions gracefully
+```
+
+**Bad**:
+```scala
+case e: YourOperatorExec if enableYourOperator =>
+  convertYourOperatorExec(e)  // ✗ Exceptions propagate, no fallback
+```
+
+**What `tryConvert` does**:
+- Catches `NotImplementedError` and other exceptions
+- Sets `convertibleTag` for tracking
+- Logs conversion attempts for debugging
+- Returns original Spark plan on failure
+
+#### Pattern 3: Validate Conversions Early
+
+**Why**: Fail fast during plan conversion, not during execution.
+
+**Good**:
+```scala
+abstract class NativeYourOperatorBase(...) extends ... {
+  // Convert and validate during plan construction
+  private def nativeExprs = {
+    expressions.map(NativeConverters.convertExpr)
+  }
+
+  // Trigger validation by accessing the val
+  nativeExprs
+
+  override def doExecuteNative(): NativeRDD = {
+    // Use pre-validated expressions
+    val nativeExprs = this.nativeExprs
+    ...
+  }
+}
+```
+
+**Bad**:
+```scala
+override def doExecuteNative(): NativeRDD = {
+  // ✗ Conversion may fail during execution, not during planning
+  val nativeExprs = expressions.map(NativeConverters.convertExpr)
+  ...
+}
+```
+
+#### Pattern 4: Preserve Output Schema
+
+**Why**: Ensures operator output matches Spark's expectations.
+
+**Good**:
+```scala
+// Filter preserves input schema
+override def output: Seq[Attribute] = FilterExec(condition, child).output
+
+// Project changes schema based on expressions
+override def output: Seq[Attribute] = projectList.map(_.toAttribute)
+```
+
+**Bad**:
+```scala
+// ✗ Hardcoding schema may not match Spark's expectations
+override def output: Seq[Attribute] = child.output.map(a =>
+  a.copy(name = "new_name")(a.exprId, a.qualifier))
+```
+
+#### Pattern 5: Consistent Metrics Definition
+
+**Why**: Provides visibility into operator performance.
+
+**Good**:
+```scala
+override lazy val metrics: Map[String, SQLMetric] =
+  SortedMap[String, SQLMetric]() ++ Map(
+    NativeHelper
+      .getDefaultNativeMetrics(sparkContext)
+      .filterKeys(Set(
+        "stage_id",          // Always include for debugging
+        "output_rows",       // Always include for cardinality
+        "elapsed_compute",   // Always include for performance
+        "operator_specific_metric"))  // Add operator-specific metrics
+      .toSeq: _*)
+```
+
+**Bad**:
+```scala
+// ✗ Missing standard metrics
+override lazy val metrics: Map[String, SQLMetric] = Map(
+  "custom_metric" -> SQLMetrics.createMetric(sparkContext, "custom"))
+```
+
+#### Pattern 6: Recursive Child Conversion
+
+**Why**: Ensures entire plan tree is converted to native.
+
+**Good**:
+```scala
+def convertFilterExec(exec: FilterExec): SparkPlan = {
+  Shims.get.createNativeFilterExec(
+    exec.condition,
+    addRenameColumnsExec(convertToNative(exec.child)))  // ✓ Recursive
+}
+```
+
+**Bad**:
+```scala
+def convertFilterExec(exec: FilterExec): SparkPlan = {
+  Shims.get.createNativeFilterExec(
+    exec.condition,
+    exec.child)  // ✗ Child may not be native
+}
+```
+
+### Anti-Patterns (Common Mistakes)
+
+#### Anti-Pattern 1: Ignoring Spark Version Differences
+
+**Bad**:
+```scala
+// ✗ Assumes all Spark versions have same method
+case class NativeFilterExec(...)
+    extends NativeFilterBase(...) {
+  override def withNewChildren(newChildren: Seq[SparkPlan]): SparkPlan =
+    copy(child = newChildren.head)
+  // Missing withNewChildInternal for Spark 3.2+
+}
+```
+
+**Good**:
+```scala
+case class NativeFilterExec(...)
+    extends NativeFilterBase(...) {
+  @sparkver("3.2 / 3.3 / 3.4 / 3.5")
+  override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
+    copy(child = newChild)
+
+  @sparkver("3.0 / 3.1")
+  override def withNewChildren(newChildren: Seq[SparkPlan]): SparkPlan =
+    copy(child = newChildren.head)
+}
+```
+
+#### Anti-Pattern 2: Forgetting Protobuf Field Numbers
+
+**Bad**:
+```protobuf
+message PhysicalPlanNode {
+  oneof PhysicalPlanType {
+    FilterExecNode filter = 8;
+    YourOperatorExecNode your_operator = 8;  // ✗ Duplicate number!
+  }
+}
+```
+
+**Good**:
+```protobuf
+message PhysicalPlanNode {
+  oneof PhysicalPlanType {
+    FilterExecNode filter = 8;
+    YourOperatorExecNode your_operator = 30;  // ✓ Unique number
+  }
+}
+```
+
+#### Anti-Pattern 3: Incorrect Metrics Reporting
+
+**Bad**:
+```scala
+// ✗ Creating new MetricNode without parent metrics
+val nativeMetrics = MetricNode(metrics, Nil)
+```
+
+**Good**:
+```scala
+// ✓ Include child metrics for proper aggregation
+val nativeMetrics = MetricNode(metrics, inputRDD.metrics :: Nil)
+```
+
+#### Anti-Pattern 4: Not Handling Empty Inputs
+
+**Bad**:
+```scala
+// ✗ Assumes partitions are non-empty
+override def doExecuteNative(): NativeRDD = {
+  val inputRDD = NativeHelper.executeNative(child)
+  val firstPartition = inputRDD.partitions(0)  // May not exist!
+  ...
+}
+```
+
+**Good**:
+```scala
+override def doExecuteNative(): NativeRDD = {
+  val inputRDD = NativeHelper.executeNative(child)
+  if (inputRDD.partitions.isEmpty) {
+    // Handle empty input gracefully
+    return createEmptyNativeRDD()
+  }
+  ...
+}
+```
+
+#### Anti-Pattern 5: Hardcoding Configuration Values
+
+**Bad**:
+```scala
+// ✗ Hardcoded configuration
+val bufferSize = 8192
+```
+
+**Good**:
+```scala
+// ✓ Use configuration system
+def bufferSize: Int =
+  AuronConverters.getIntConf("spark.auron.bufferSize", defaultValue = 8192)
+```
+
+#### Anti-Pattern 6: Mixing Scala and Java Collections
+
+**Bad**:
+```scala
+import scala.collection.JavaConverters._
+
+// ✗ Forgetting .asJava conversion
+val nativeExec = FilterExecNode.newBuilder()
+  .addAllExpr(nativeExprs)  // Compile error: expects Java List
+  .build()
+```
+
+**Good**:
+```scala
+import scala.collection.JavaConverters._
+
+val nativeExec = FilterExecNode.newBuilder()
+  .addAllExpr(nativeExprs.asJava)  // ✓ Convert to Java List
+  .build()
+```
+
+### Code Review Checklist
+
+Before submitting your operator implementation, verify:
+
+**Scala Implementation**:
+- [ ] Used `tryConvert` in AuronConverters
+- [ ] Called `addRenameColumnsExec` on child plans
+- [ ] Validated expressions in base class constructor
+- [ ] Defined metrics using `NativeHelper.getDefaultNativeMetrics`
+- [ ] Implemented both `withNewChildInternal` and `withNewChildren`
+- [ ] Converted Scala collections to Java with `.asJava`
+- [ ] Preserved `outputPartitioning` and `outputOrdering` when appropriate
+
+**Protobuf Definition**:
+- [ ] Used unique field number in `PhysicalPlanNode`
+- [ ] Followed naming convention: `YourOperatorExecNode`
+- [ ] Included all necessary fields (input, expressions, config)
+
+**Rust Implementation**:
+- [ ] Added module to `lib.rs`
+- [ ] Implemented all required `ExecutionPlan` methods
+- [ ] Used `ExecutionContext` for metrics and batch coalescing
+- [ ] Validated inputs in `try_new` constructor
+- [ ] Handled errors with `Result<T>`
+
+**Testing**:
+- [ ] Added test suite in `spark-extension-shims-spark3/src/test`
+- [ ] Tested with empty inputs
+- [ ] Tested with NULL values
+- [ ] Tested integration with other operators
+- [ ] Verified native execution in plan
+
+## Deep Dive: Metrics and Performance Monitoring
+
+Metrics provide visibility into operator performance and are essential for debugging and
+optimization. This section explains Auron's metrics system in detail.
+
+### Metrics Architecture
+
+#### MetricNode Structure
+
+Metrics flow through the execution plan tree using `MetricNode`:
+
+```scala
+case class MetricNode(
+  metrics: Map[String, SQLMetric],           // Operator's own metrics
+  children: Seq[MetricNode],                 // Child operator metrics
+  specialFn: Option[(String, Long) => Unit]  // Optional custom metric handling
+)
+```
+
+**Example usage**:
+```scala
+override def doExecuteNative(): NativeRDD = {
+  val inputRDD = NativeHelper.executeNative(child)
+
+  // Create metric node linking this operator's metrics to child's metrics
+  val nativeMetrics = MetricNode(
+    metrics,                    // This operator's metrics
+    inputRDD.metrics :: Nil,    // Child metrics
+    None)                       // No special handling
+
+  new NativeRDD(..., nativeMetrics, ...)
+}
+```
+
+### Standard Metrics
+
+#### Core Metrics (All Operators)
+
+```scala
+NativeHelper.getDefaultNativeMetrics(sparkContext).filterKeys(Set(
+  "stage_id",         // Spark stage ID (for correlation)
+  "output_rows",      // Number of rows produced
+  "elapsed_compute"   // Native computation time (nanoseconds)
+))
+```
+
+**When to use**:
+- `stage_id`: Always include (required for Spark UI integration)
+- `output_rows`: Always include (shows cardinality)
+- `elapsed_compute`: Always include (shows performance)
+
+#### I/O Metrics (Scan Operators)
+
+```scala
+Map(
+  "bytes_scanned" -> SQLMetrics.createSizeMetric(sc, "Native.bytes_scanned"),
+  "io_time" -> SQLMetrics.createNanoTimingMetric(sc, "Native.io_time"),
+  "io_time_getfs" -> SQLMetrics.createNanoTimingMetric(sc, "Native.io_time_getfs")
+)
+```
+
+**Use in**: `NativeParquetScanBase`, `NativeOrcScanBase`, `NativeFileSourceScanBase`
+
+#### Join Metrics (Join Operators)
+
+```scala
+Map(
+  "build_hash_map_time" -> nanoTimingMetric("Native.build_hash_map_time"),
+  "probed_side_hash_time" -> nanoTimingMetric("Native.probed_side_hash_time"),
+  "probed_side_search_time" -> nanoTimingMetric("Native.probed_side_search_time"),
+  "probed_side_compare_time" -> nanoTimingMetric("Native.probed_side_compare_time"),
+  "build_output_time" -> nanoTimingMetric("Native.build_output_time"),
+  "fallback_sort_merge_join_time" -> nanoTimingMetric("...")
+)
+```
+
+**Use in**: `NativeBroadcastJoinBase`, `NativeShuffledHashJoinBase`,
+`NativeSortMergeJoinBase`
+
+#### Spill Metrics (Memory-Intensive Operators)
+
+```scala
+Map(
+  "mem_spill_count" -> metric("Native.mem_spill_count"),
+  "mem_spill_size" -> sizeMetric("Native.mem_spill_size"),
+  "mem_spill_iotime" -> nanoTimingMetric("Native.mem_spill_iotime"),
+  "disk_spill_size" -> sizeMetric("Native.disk_spill_size"),
+  "disk_spill_iotime" -> nanoTimingMetric("Native.disk_spill_iotime")
+)
+```
+
+**Use in**: `NativeAggBase`, `NativeSortBase`, Join operators
+
+#### Shuffle Metrics (Exchange Operators)
+
+```scala
+Map(
+  "shuffle_write_total_time" -> nanoTimingMetric("Native.shuffle_write_total_time"),
+  "shuffle_read_total_time" -> nanoTimingMetric("Native.shuffle_read_total_time")
+)
+```
+
+**Use in**: `NativeShuffleExchangeBase`
+
+#### Aggregate Metrics (Aggregate Operators)
+
+```scala
+Map(
+  "hashing_time" -> nanoTimingMetric("Native.hashing_time"),
+  "merging_time" -> nanoTimingMetric("Native.merging_time"),
+  "output_time" -> nanoTimingMetric("Native.output_time")
+)
+```
+
+**Use in**: `NativeAggBase`
+
+### Metric Types
+
+#### 1. Counter Metrics
+
+```scala
+// Count occurrences
+def metric(name: String) = SQLMetrics.createMetric(sc, name)
+
+// Example: counting rows
+metrics("output_rows") += numRows
+```
+
+#### 2. Timing Metrics
+
+```scala
+// Measure elapsed time in nanoseconds
+def nanoTimingMetric(name: String) =
+  SQLMetrics.createNanoTimingMetric(sc, name)
+
+// Example: timing computation
+val startTime = System.nanoTime()
+// ... do work ...
+metrics("elapsed_compute") += (System.nanoTime() - startTime)
+```
+
+#### 3. Size Metrics
+
+```scala
+// Measure data sizes in bytes (displays as KB/MB/GB in UI)
+def sizeMetric(name: String) = SQLMetrics.createSizeMetric(sc, name)
+
+// Example: tracking bytes read
+metrics("bytes_scanned") += bytesRead
+```
+
+### Adding Custom Metrics
+
+#### Example: Window Operator Metrics
+
+```scala
+override lazy val metrics: Map[String, SQLMetric] =
+  SortedMap[String, SQLMetric]() ++ Map(
+    NativeHelper
+      .getDefaultNativeMetrics(sparkContext)
+      .filterKeys(Set(
+        "stage_id",
+        "output_rows",
+        "elapsed_compute",
+        "mem_spill_count",
+        "mem_spill_size",
+        "mem_spill_iotime",
+        "disk_spill_size",
+        "disk_spill_iotime"))
+      .toSeq: _*) ++
+  Map(
+    // Custom metrics for window operations
+    "window_compute_time" ->
+      SQLMetrics.createNanoTimingMetric(sparkContext, "Native.window_compute_time"),
+    "window_rows_processed" ->
+      SQLMetrics.createMetric(sparkContext, "Native.window_rows_processed"))
+```
+
+### Metric Reporting Patterns
+
+#### Pattern 1: Direct Metric Updates (Scala)
+
+```scala
+override def doExecuteNative(): NativeRDD = {
+  // Metrics updated directly in Scala code
+  metrics("output_rows") += resultRows
+  metrics("elapsed_compute") += computeTime
+}
+```
+
+**Use when**: Scala code has visibility to the metric values
+
+#### Pattern 2: Native Metric Reporting (Rust)
+
+```rust
+// Rust side: report metrics via ExecutionContext
+let exec_ctx = ExecutionContext::new(
+    context, partition, self.schema(), &self.metrics);
+
+// Metrics automatically tracked:
+// - elapsed_compute: Total execution time
+// - output_rows: Number of output rows
+// - mem_spill_*: Memory spilling statistics
+```
+
+**Use when**: Metrics are generated during native execution
+
+#### Pattern 3: Custom Metric Mapping
+
+```scala
+val nativeMetrics = MetricNode(
+  metrics,
+  inputRDD.metrics :: Nil,
+  Some({
+    // Map native metric names to Spark metric names
+    case ("output_rows", v) =>
+      val shuffleReadMetrics = TaskContext.get.taskMetrics()
+        .createTempShuffleReadMetrics()
+      new SQLShuffleReadMetricsReporter(shuffleReadMetrics, metrics)
+        .incRecordsRead(v)
+      TaskContext.get.taskMetrics().mergeShuffleReadMetrics()
+    case ("elapsed_compute", v) =>
+      metrics("shuffle_read_total_time") += v
+    case _ =>
+  }))
+```
+
+**Use when**: Native metrics need special handling or mapping
+
+### Input Batch Statistics (Optional)
+
+Enable detailed input statistics:
+
+```scala
+spark.conf.set("spark.auron.input.batch.statistics.enable", "true")
+```
+
+**Additional metrics**:
+```scala
+Map(
+  "input_batch_count" -> metric("Native.input_batches"),
+  "input_row_count" -> metric("Native.input_rows"),
+  "input_batch_mem_size" -> sizeMetric("Native.input_mem_bytes")
+)
+```
+
+**Use for**: Debugging batch size issues, understanding data distribution
+
+### Parquet-Specific Metrics
+
+For Parquet scan operations:
+
+```scala
+Map(
+  "predicate_evaluation_errors" -> metric("Native.predicate_evaluation_errors"),
+  "row_groups_matched_bloom_filter" -> metric("Native.row_groups_matched_bloom_filter"),
+  "row_groups_pruned_bloom_filter" -> metric("Native.row_groups_pruned_bloom_filter"),
+  "row_groups_matched_statistics" -> metric("Native.row_groups_matched_statistics"),
+  "row_groups_pruned_statistics" -> metric("Native.row_groups_pruned_statistics"),
+  "pushdown_rows_filtered" -> metric("Native.pushdown_rows_filtered"),
+  "pushdown_eval_time" -> nanoTimingMetric("Native.pushdown_eval_time"),
+  "page_index_rows_filtered" -> metric("Native.page_index_rows_filtered"),
+  "page_index_eval_time" -> nanoTimingMetric("Native.page_index_eval_time")
+)
+```
+
+**Use for**: Understanding filter pushdown effectiveness
+
+### Viewing Metrics
+
+#### Spark UI
+
+1. Navigate to SQL tab in Spark UI (http://localhost:4040/SQL/)
+2. Click on query to see execution plan
+3. Expand operator nodes to see metrics
+4. Native operators show with "Native." prefix
+
+#### Programmatic Access
+
+```scala
+// Get metrics from DataFrame execution
+val df = spark.sql("SELECT * FROM table WHERE id > 100")
+df.collect()  // Execute query
+
+val metrics = df.queryExecution.executedPlan.metrics
+metrics.foreach { case (name, metric) =>
+  println(s"$name: ${metric.value}")
+}
+```
+
+### Performance Debugging with Metrics
+
+#### Identify Bottlenecks
+
+```scala
+// High elapsed_compute but low output_rows suggests expensive computation per row
+if (metrics("elapsed_compute").value > threshold &&
+    metrics("output_rows").value < expectedRows) {
+  // Check expression complexity, consider optimization
+}
+
+// High spill metrics suggest memory pressure
+if (metrics("mem_spill_count").value > 0) {
+  // Increase executor memory or reduce batch size
+}
+
+// High shuffle times suggest network bottleneck
+if (metrics("shuffle_read_total_time").value > threshold) {
+  // Check data skew, consider repartitioning
+}
+```
+
+### Best Practices for Metrics
+
+1. **Always include core metrics**: `stage_id`, `output_rows`, `elapsed_compute`
+2. **Use SortedMap**: Ensures consistent metric ordering in UI
+3. **Follow naming convention**: Prefix with "Native." for clarity
+4. **Choose appropriate metric type**: Counter, timing, or size
+5. **Include child metrics**: `MetricNode(metrics, childMetrics :: Nil)`
+6. **Document custom metrics**: Add comments explaining purpose
+7. **Test metric accuracy**: Verify metrics match expected values
+
 ## Additional Resources
 
 ### Documentation
