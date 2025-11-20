@@ -43,7 +43,7 @@ Merge all files from a single directory:
   --output merged-output/
 ```
 
-**Output**: `merged-output/plan.scala`
+**Output**: `merged-output/plan.scala.txt`
 
 #### Merge all Scala files recursively
 
@@ -148,12 +148,12 @@ Directories containing `/test/` in their path are automatically skipped.
 
 ### Subdirectories (with --recursive)
 Each subdirectory creates its own merged file named after the directory:
-- `foo/bar/` → `foo/bar.scala`
-- `baz/qux/` → `baz/qux.rs`
+- `foo/bar/` → `foo/bar.scala.txt`
+- `baz/qux/` → `baz/qux.rs.txt`
 
 ### Multiple Languages
 If a directory contains multiple languages without `--lang` filter, separate merged files are created:
-- `mydir/` with `.scala` and `.java` files → `mydir.scala` and `mydir.java`
+- `mydir/` with `.scala` and `.java` files → `mydir.scala.txt` and `mydir.java.txt`
 
 ## Example Output
 
@@ -175,7 +175,7 @@ spark-extension/src/main/scala/org/apache/spark/sql/auron/plan/
 
 ### Output
 ```
-merged/plan.scala  (all 4 files merged, ~200KB)
+merged/plan.scala.txt  (all 4 files merged, ~200KB)
 ```
 
 ## Use Cases
