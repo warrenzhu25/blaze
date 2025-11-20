@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""
+File Merge Tool for Auron Project
+
+Merges code files from directories into single files per directory,
+removing license headers and import statements while preserving
+package declarations and code structure.
+
+Usage:
+    ./dev/merge-files --input <input_dir> --output <output_dir> [options]
+
+Examples:
+    # Merge Scala files from a directory
+    ./dev/merge-files --input spark-extension/src/main/scala/org/apache/spark/sql/auron/plan \
+                      --output merged-output/
+
+    # Merge all Scala files recursively
+    ./dev/merge-files --input spark-extension/src/main/scala \
+                      --output merged-output/ \
+                      --lang scala \
+                      --recursive
+
+    # Merge Rust files
+    ./dev/merge-files --input native-engine/datafusion-ext-plans/src \
+                      --output merged-output/ \
+                      --lang rust \
+                      --recursive
+"""
+
+import argparse
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+
+# Language file extensions
+LANGUAGE_EXTENSIONS = {
+    'scala': ['.scala'],
+    'rust': ['.rs'],
+    'java': ['.java'],
+}
+
+# License header patterns
+LICENSE_PATTERNS = {
+    'scala': re.compile(r'^/\*\s*\n\s*\* Licensed to the Apache Software Foundation'),
+    'java': re.compile(r'^/\*\s*\n\s*\* Licensed to the Apache Software Foundation'),
+    'rust': re.compile(r'^//\s*Licensed to the Apache Software Foundation'),
+}
+
+# Lines to skip for license headers
+LICENSE_HEADER_LINES = {
+    'scala': 16,
+    'java': 16,
+    'rust': 14,
+}
+
+
+def detect_language(file_path: Path) -> Optional[str]:
+    """Detect programming language from file extension."""
+    suffix = file_path.suffix.lower()
+    for lang, extensions in LANGUAGE_EXTENSIONS.items():
+        if suffix in extensions:
+            return lang
+    return None
+
+
+def is_license_header(content: str, language: str) -> bool:
+    """Check if content starts with Apache license header."""
+    pattern = LICENSE_PATTERNS.get(language)
+    if pattern:
+        return pattern.match(content) is not None
+    return False
+
+
+def remove_license_header(content: str, language: str) -> str:
+    """Remove Apache license header from file content."""
+    lines = content.split('\n')
+
+    # Check if it has license header
+    if not is_license_header(content, language):
+        return content
+
+    # Skip license header lines
+    header_lines = LICENSE_HEADER_LINES.get(language, 0)
+    if len(lines) > header_lines:
+        # Skip header and any blank lines immediately after
+        remaining = lines[header_lines:]
+        while remaining and not remaining[0].strip():
+            remaining.pop(0)
+        return '\n'.join(remaining)
+
+    return content
+
+
+def extract_package_declaration(content: str, language: str) -> Optional[str]:
+    """Extract package/module declaration from content."""
+    lines = content.split('\n')
+
+    if language in ['scala', 'java']:
+        # Look for package declaration
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('package ') and not stripped.startswith('package object'):
+                return stripped
+
+    # For Rust, we don't typically need package declarations in merged files
+    return None
+
+
+def remove_imports(content: str, language: str) -> Tuple[str, List[str]]:
+    """
+    Remove import/use statements from content.
+    Returns (content_without_imports, list_of_imports)
+    """
+    lines = content.split('\n')
+    imports = []
+    code_lines = []
+    in_import_block = False
+
+    if language in ['scala', 'java']:
+        for line in lines:
+            stripped = line.strip()
+
+            # Check if it's an import line
+            if stripped.startswith('import '):
+                imports.append(line)
+                in_import_block = True
+            # Check if blank line after imports (transition to code)
+            elif in_import_block and not stripped:
+                in_import_block = False
+                # Don't add blank line yet, will add separator later
+            # Regular code
+            else:
+                code_lines.append(line)
+
+    elif language == 'rust':
+        for line in lines:
+            stripped = line.strip()
+
+            # Remove use statements
+            if stripped.startswith('use '):
+                imports.append(line)
+                in_import_block = True
+            # Remove mod declarations (module structure)
+            elif stripped.startswith('mod ') or stripped.startswith('pub mod '):
+                imports.append(line)
+                in_import_block = True
+            # Check if blank line after imports
+            elif in_import_block and not stripped:
+                in_import_block = False
+            # Regular code
+            else:
+                code_lines.append(line)
+
+    else:
+        code_lines = lines
+
+    return '\n'.join(code_lines), imports
+
+
+def create_file_separator(filename: str, width: int = 70) -> str:
+    """Create a separator comment for file boundaries."""
+    separator = '=' * width
+    return f"\n// {separator}\n// Source: {filename}\n// {separator}\n"
+
+
+def get_file_priority(filename: str, language: str) -> int:
+    """
+    Determine file processing priority (lower = earlier).
+    Special files like mod.rs, lib.rs, *Base.scala should be processed first.
+    """
+    name = filename.lower()
+
+    if language == 'rust':
+        if name == 'lib.rs':
+            return 0
+        elif name == 'mod.rs':
+            return 1
+
+    elif language == 'scala':
+        if 'base.scala' in name:
+            return 2
+
+    # Default priority (alphabetical)
+    return 1000
+
+
+def sort_files(files: List[Path], language: str) -> List[Path]:
+    """Sort files by priority and then alphabetically."""
+    return sorted(files, key=lambda f: (get_file_priority(f.name, language), f.name))
+
+
+def merge_files(files: List[Path], language: str, preserve_package: bool = True) -> str:
+    """
+    Merge multiple files into single content.
+
+    Args:
+        files: List of file paths to merge
+        language: Programming language
+        preserve_package: Whether to preserve package declaration
+
+    Returns:
+        Merged file content
+    """
+    if not files:
+        return ""
+
+    # Sort files by priority
+    sorted_files = sort_files(files, language)
+
+    # Extract package declaration from first file
+    package_decl = None
+    if preserve_package and language in ['scala', 'java']:
+        first_content = sorted_files[0].read_text(encoding='utf-8')
+        first_content_clean = remove_license_header(first_content, language)
+        package_decl = extract_package_declaration(first_content_clean, language)
+
+    # Generate header
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    dir_name = sorted_files[0].parent.name
+    header_lines = [
+        f"// Merged from directory: {dir_name}",
+        f"// Source files: {len(sorted_files)} files",
+        f"// Generated: {timestamp}",
+        "",
+    ]
+
+    # Add package declaration if found
+    if package_decl:
+        header_lines.append(package_decl)
+        header_lines.append("")
+
+    merged_content = '\n'.join(header_lines)
+
+    # Process each file
+    for file_path in sorted_files:
+        try:
+            # Read file
+            content = file_path.read_text(encoding='utf-8')
+
+            # Remove license header
+            content = remove_license_header(content, language)
+
+            # Remove package declaration if we're using a global one
+            if package_decl and language in ['scala', 'java']:
+                content_lines = content.split('\n')
+                content_lines = [
+                    line for line in content_lines
+                    if not line.strip().startswith('package ')
+                ]
+                content = '\n'.join(content_lines)
+
+            # Remove imports
+            content, imports = remove_imports(content, language)
+
+            # Strip leading/trailing blank lines
+            content = content.strip()
+
+            # Add file separator
+            separator = create_file_separator(file_path.name)
+            merged_content += separator
+
+            # Add file content
+            merged_content += content + '\n'
+
+        except Exception as e:
+            print(f"Warning: Error processing {file_path}: {e}", file=sys.stderr)
+            continue
+
+    return merged_content
+
+
+def get_output_filename(input_dir: Path, language: str) -> str:
+    """Generate output filename based on directory name and language."""
+    dir_name = input_dir.name
+    ext = LANGUAGE_EXTENSIONS[language][0]
+    return f"{dir_name}{ext}"
+
+
+def merge_directory(
+    input_dir: Path,
+    output_dir: Path,
+    language_filter: Optional[str] = None,
+    recursive: bool = False
+) -> None:
+    """
+    Merge files from a directory into a single output file.
+
+    Args:
+        input_dir: Input directory path
+        output_dir: Output directory path
+        language_filter: Filter by language (scala, rust, java) or None for all
+        recursive: Whether to process subdirectories
+    """
+    if not input_dir.is_dir():
+        print(f"Error: {input_dir} is not a directory", file=sys.stderr)
+        return
+
+    # Skip test directories
+    if 'test' in input_dir.parts:
+        print(f"Skipping test directory: {input_dir}")
+        return
+
+    # Process current directory
+    files_by_lang = {}
+
+    for file_path in input_dir.iterdir():
+        if file_path.is_file():
+            lang = detect_language(file_path)
+            if lang and (language_filter is None or lang == language_filter):
+                if lang not in files_by_lang:
+                    files_by_lang[lang] = []
+                files_by_lang[lang].append(file_path)
+
+    # Merge files for each language
+    for lang, files in files_by_lang.items():
+        if not files:
+            continue
+
+        print(f"Merging {len(files)} {lang} files from {input_dir}")
+
+        # Create merged content
+        merged_content = merge_files(files, lang)
+
+        # Determine output path
+        relative_path = input_dir.relative_to(input_dir.parent)
+        output_file_dir = output_dir / relative_path.parent
+        output_file_dir.mkdir(parents=True, exist_ok=True)
+
+        output_filename = get_output_filename(input_dir, lang)
+        output_file = output_file_dir / output_filename
+
+        # Write merged file
+        output_file.write_text(merged_content, encoding='utf-8')
+        print(f"  → Created: {output_file}")
+
+    # Process subdirectories recursively if requested
+    if recursive:
+        for subdir in input_dir.iterdir():
+            if subdir.is_dir():
+                merge_directory(subdir, output_dir, language_filter, recursive)
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description='Merge code files from directories, removing licenses and imports',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+
+    parser.add_argument(
+        '--input', '-i',
+        type=Path,
+        required=True,
+        help='Input directory containing source files'
+    )
+
+    parser.add_argument(
+        '--output', '-o',
+        type=Path,
+        required=True,
+        help='Output directory for merged files'
+    )
+
+    parser.add_argument(
+        '--lang', '-l',
+        choices=['scala', 'rust', 'java', 'all'],
+        default='all',
+        help='Filter by language (default: all)'
+    )
+
+    parser.add_argument(
+        '--recursive', '-r',
+        action='store_true',
+        help='Process subdirectories recursively'
+    )
+
+    args = parser.parse_args()
+
+    # Validate input directory
+    if not args.input.exists():
+        print(f"Error: Input directory does not exist: {args.input}", file=sys.stderr)
+        sys.exit(1)
+
+    # Create output directory
+    args.output.mkdir(parents=True, exist_ok=True)
+
+    # Determine language filter
+    lang_filter = None if args.lang == 'all' else args.lang
+
+    # Merge files
+    print(f"Merging files from: {args.input}")
+    print(f"Output directory: {args.output}")
+    print(f"Language filter: {args.lang}")
+    print(f"Recursive: {args.recursive}")
+    print()
+
+    merge_directory(args.input, args.output, lang_filter, args.recursive)
+
+    print()
+    print("✓ Merge completed successfully!")
+
+
+if __name__ == '__main__':
+    main()
