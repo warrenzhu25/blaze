@@ -11,6 +11,7 @@ This directory contains comprehensive documentation for learning and understandi
 | [CRITICAL-PATHS.md](CRITICAL-PATHS.md) | End-to-end execution paths with code references | Advanced |
 | [EXTENSION-GUIDE.md](EXTENSION-GUIDE.md) | How to extend Auron with new operators and expressions | Contributors |
 | [GLOSSARY.md](GLOSSARY.md) | Key terms and concepts | All levels |
+| [MERGED-FILES.md](MERGED-FILES.md) | Pre-merged code files for LLM analysis and learning | All levels |
 
 ## Quick Start
 
@@ -18,6 +19,7 @@ This directory contains comprehensive documentation for learning and understandi
 2. **Want to understand a specific module?** Check [MODULE-GUIDE.md](MODULE-GUIDE.md)
 3. **Need to trace code execution?** See [CRITICAL-PATHS.md](CRITICAL-PATHS.md)
 4. **Ready to contribute?** Read [EXTENSION-GUIDE.md](EXTENSION-GUIDE.md) and [../CONTRIBUTING.md](../../CONTRIBUTING.md)
+5. **Using LLMs for analysis?** See [MERGED-FILES.md](MERGED-FILES.md) for pre-consolidated code files
 
 ## Architecture at a Glance
 
