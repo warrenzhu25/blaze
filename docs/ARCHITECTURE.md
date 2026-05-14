@@ -1,15 +1,34 @@
 # Apache Auron Architecture Documentation
 
-> **Single-file version** - All architecture documentation merged for easy reference and LLM analysis.
->
-> **Contents**: System Overview | Module Guide | Critical Paths | Extension Guide | Glossary
+> **Single-file reference** for system architecture, module details, execution paths, and extension patterns.
 
 ---
 
+## Table of Contents
 
+- [System Overview](#auron-system-overview)
+- [How It Works](#how-it-works)
+  - [Join Execution](#join-execution)
+  - [Aggregation](#aggregation)
+  - [Shuffle](#shuffle)
+  - [Memory Management](#memory-management)
+- [Module Deep Dives](#auron-module-deep-dives)
+- [Critical Execution Paths](#critical-execution-paths)
+- [Extension Guide](#auron-extension-guide)
+- [Glossary](#auron-glossary)
+
+## How to Read This Document
+
+| If you want to... | Start with... |
+|-------------------|---------------|
+| Understand what Auron does | [System Overview](#auron-system-overview) |
+| Learn how joins/agg/shuffle work | [How It Works](#how-it-works) |
+| Explore the codebase | [Module Deep Dives](#auron-module-deep-dives) |
+| Trace code execution | [Critical Execution Paths](#critical-execution-paths) |
+| Add a new operator | [Extension Guide](#auron-extension-guide) |
+| Look up a term | [Glossary](#auron-glossary) |
 
 ---
-
 
 # Auron System Overview
 
@@ -37,30 +56,13 @@ Spark's default execution model processes data row-by-row in the JVM. This appro
 
 ## High-Level Architecture
 
-```mermaid
-graph TB
-    subgraph Spark["Apache Spark (JVM)"]
-        SQL[SQL Query] --> Catalyst[Catalyst Optimizer]
-        Catalyst --> PhysPlan[Physical Plan]
-        PhysPlan --> Auron[Auron Extension]
-    end
+Auron is split across three execution layers:
 
-    subgraph AuronLayer["Auron Spark Extension"]
-        Auron --> Converter[AuronConverters]
-        Converter --> NativeOps[Native Operators]
-        NativeOps --> Proto[Protobuf Serialization]
-    end
+1. **Spark JVM layer**: Spark receives SQL, Catalyst builds a physical plan, and `AuronSparkSessionExtension` installs a columnar rule that can replace supported Spark operators with native Auron operators.
+2. **Auron Spark extension layer**: `AuronConverters` and `NativeConverters` translate Spark plans and expressions into Auron native operators and Protobuf messages.
+3. **Rust native layer**: JNI calls enter the `auron` crate, `NativeExecutionRuntime` deserializes the Protobuf task definition, DataFusion executes the plan, and Arrow batches are returned to Spark through Arrow FFI.
 
-    subgraph Native["Native Engine (Rust)"]
-        Proto -->|JNI| Bridge[JNI Bridge]
-        Bridge --> Runtime[Auron Runtime]
-        Runtime --> DF[DataFusion Execution]
-        DF --> Arrow[Arrow RecordBatch]
-    end
-
-    Arrow -->|FFI| Results[Results to Spark]
-    Results --> Spark
-```
+The main boundary crossings are Protobuf for plan shape, JNI for control calls, and Arrow FFI for batch data.
 
 ### Components
 
@@ -79,79 +81,16 @@ graph TB
 
 ### Query Execution Flow
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 1. SPARK QUERY PLANNING                                                  │
-│    User submits SQL: SELECT * FROM t WHERE x > 10                       │
-│    ↓                                                                     │
-│    Catalyst creates optimized Physical Plan                              │
-│    ↓                                                                     │
-│    AuronSparkSessionExtension intercepts via ColumnarRule               │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 2. PLAN CONVERSION (Scala)                                               │
-│    AuronConverters.convertSparkPlanRecursively()                        │
-│    ↓                                                                     │
-│    Each SparkPlan node → NativeXxxExec (e.g., FilterExec → NativeFilter)│
-│    ↓                                                                     │
-│    Expressions converted via NativeConverters.convertExpr()             │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 3. NATIVE PLAN SERIALIZATION                                             │
-│    NativeXxxBase.doExecuteNative() creates NativeRDD                    │
-│    ↓                                                                     │
-│    Plan serialized to Protobuf (PhysicalPlanNode)                       │
-│    ↓                                                                     │
-│    NativeRDD.compute() called per partition                             │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 4. JNI BOUNDARY CROSSING                                                 │
-│    AuronCallNativeWrapper created for each partition                    │
-│    ↓                                                                     │
-│    JniBridge.callNative() → Rust entry point                            │
-│    ↓                                                                     │
-│    TaskDefinition (protobuf) passed to Rust                             │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 5. RUST NATIVE EXECUTION                                                 │
-│    NativeExecutionRuntime deserializes plan                             │
-│    ↓                                                                     │
-│    from_proto.rs converts Protobuf → DataFusion ExecutionPlan           │
-│    ↓                                                                     │
-│    DataFusion executes plan, produces Arrow RecordBatches               │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 6. RESULT RETURN (Arrow FFI)                                             │
-│    JniBridge.nextBatch() returns Arrow data via FFI pointers            │
-│    ↓                                                                     │
-│    AuronCallNativeWrapper.importBatch() deserializes Arrow              │
-│    ↓                                                                     │
-│    AuronColumnarBatchRow converts to Spark InternalRow                  │
-│    ↓                                                                     │
-│    Iterator[InternalRow] returned to Spark                              │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+1. **Spark query planning**: the user submits SQL, Catalyst produces an optimized physical plan, and the injected Auron columnar rule inspects that plan before Spark inserts columnar transitions.
+2. **Plan conversion in Scala**: `AuronConvertStrategy` marks each node with a conversion decision, then `AuronConverters.convertSparkPlanRecursively()` replaces supported Spark operators with `NativeXxxExec` operators. `NativeConverters.convertExpr()` converts supported Spark expressions into Protobuf expression nodes.
+3. **Native plan serialization**: each `NativeXxxBase.doExecuteNative()` implementation creates a `NativeRDD` whose partition function builds a `PhysicalPlanNode`.
+4. **JNI boundary crossing**: `NativeRDD.compute()` creates an `AuronCallNativeWrapper`, serializes a `TaskDefinition`, and calls `JniBridge.callNative()`.
+5. **Rust native execution**: `NativeExecutionRuntime::start()` decodes the task definition, `auron-serde` converts the Protobuf plan into DataFusion `ExecutionPlan` nodes, and DataFusion produces Arrow `RecordBatch` output.
+6. **Result return**: `JniBridge.nextBatch()` drives the Rust stream. Each batch is exported through Arrow FFI, imported by `AuronCallNativeWrapper.importBatch()`, and exposed back to Spark as rows or columnar batches.
 
 ### Memory Flow
 
-```
-┌─────────────────┐         ┌─────────────────┐
-│   JVM Heap      │         │  Native Memory  │
-│                 │         │                 │
-│  Spark Objects  │         │  Arrow Buffers  │
-│  Task Context   │◄───────▶│  Rust Structs   │
-│  Metrics        │   FFI   │  DataFusion     │
-│                 │         │                 │
-└─────────────────┘         └─────────────────┘
-         │                           │
-         ▼                           ▼
-   OnHeapSpillManager         MemManager (spill to disk)
-```
+Spark-side objects, task context, and SQL metrics remain on the JVM side. Arrow buffers, DataFusion operators, and intermediate native state live in Rust-managed native memory. Arrow FFI connects the two sides without row-by-row serialization. JVM spill paths are coordinated through `OnHeapSpillManager`; native aggregation, sort, and join operators reserve and release memory through `MemManager`, spilling native data when pressure is too high.
 
 ## Supported Operations
 
@@ -226,17 +165,7 @@ spark.conf.set("spark.auron.enable", "true")  // Default: true
 
 When an operation cannot be executed natively, Auron automatically falls back to Spark execution:
 
-```
-Native Plan                 Fallback Point           Spark Execution
-     │                           │                         │
-     ▼                           ▼                         ▼
-┌─────────┐              ┌──────────────┐           ┌─────────┐
-│ Native  │              │ ConvertTo-   │           │ Spark   │
-│ Filter  │─────────────▶│ Native/      │──────────▶│ Join    │
-│         │              │ ConvertFrom- │           │ (row)   │
-└─────────┘              │ Native       │           └─────────┘
-                         └──────────────┘
-```
+Fallback is expressed in the physical plan as conversion boundaries. A supported subtree can stay native, an unsupported operator runs in Spark, and `ConvertToNative` or `ConvertFromNative` operators bridge the representation at the boundary. The converter tries to avoid inefficient native islands, so a supported operator may remain in Spark if its surrounding plan would require expensive transitions.
 
 Common fallback reasons:
 - Unsupported expression types
@@ -246,53 +175,319 @@ Common fallback reasons:
 
 ## Next Steps
 
-- **Module Deep Dives**: See [MODULE-GUIDE.md](MODULE-GUIDE.md) for detailed component documentation
-- **Execution Paths**: See [CRITICAL-PATHS.md](CRITICAL-PATHS.md) for code-level tracing
-- **Contributing**: See [EXTENSION-GUIDE.md](EXTENSION-GUIDE.md) and [CONTRIBUTING.md](../../CONTRIBUTING.md)
-
+- **Module Deep Dives**: See [Module Deep Dives](#auron-module-deep-dives) for detailed component documentation
+- **Execution Paths**: See [Critical Execution Paths](#critical-execution-paths) for code-level tracing
+- **Contributing**: See [Extension Guide](#auron-extension-guide) and [CONTRIBUTING.md](../../CONTRIBUTING.md)
 
 ---
 
+# How It Works
+
+This section explains the core logic behind Auron's main operations: joins, aggregation, shuffle, and memory management.
+
+## Join Execution
+
+Auron supports three join strategies that execute natively in Rust.
+
+### Sort-Merge Join
+
+Used when both inputs are already sorted by join keys.
+
+**Execution Flow:**
+1. Both inputs stream in sorted order
+2. `StreamCursor` tracks position in each stream with pre-computed key rows
+3. Compare cursors: advance the smaller side, collect matches on equality
+4. Flush matched rows to output batches
+
+**Key Components:**
+- `SortMergeJoinExec` (Rust) - Main execution plan
+- `StreamCursor` - Optimized cursor with key comparison
+- Joiners: Inner, LeftOuter, RightOuter, FullOuter, Semi, Anti
+
+**Code Path:**
+```
+NativeSortMergeJoinBase.doExecuteNative()
+  → SortMergeJoinExecNode (protobuf)
+  → SortMergeJoinExec.execute_join()
+    → StreamCursor compare loop
+    → Batch output
+```
+
+### Broadcast Hash Join
+
+Used when one side is small enough to broadcast.
+
+**Execution Flow:**
+1. **Build phase**: Materialize broadcast side into hash map
+   - Extract key columns, compute Spark-compatible Murmur3 hashes
+   - Store in SIMD-aligned `MapValueGroup` (64-byte cache lines)
+2. **Probe phase**: Stream probe side, look up each row
+   - Hash probe keys, find matches in map
+   - Output joined rows
+
+**Hash Map Structure:**
+- 8 hashes per cache line (SIMD comparison)
+- Single values stored inline, collisions chain via `mapped_indices`
+- Cached hash maps reusable across stages (`cachedBuildHashMapId`)
+
+**Code Path:**
+```
+NativeBroadcastJoinBase.doExecuteNative()
+  → BroadcastJoinExecNode (protobuf)
+  → BroadcastJoinExec.execute_join()
+    → Build: JoinHashMap construction
+    → Probe: Streaming hash lookups
+```
+
+### Join Types
+
+| Type | Behavior |
+|------|----------|
+| INNER | Output rows where both sides match |
+| LEFT | All left rows + matched right (null if no match) |
+| RIGHT | All right rows + matched left (null if no match) |
+| FULL | All rows from both sides |
+| LEFT_SEMI | Left rows that have a match (no right columns) |
+| LEFT_ANTI | Left rows that have NO match |
+
+---
+
+## Aggregation
+
+Auron implements native aggregation with two modes and three phases.
+
+### Aggregation Modes
+
+**Hash Aggregation** (default):
+- Uses hash table keyed by grouping columns
+- Fast for high-cardinality groupings
+- Memory-intensive, spills when needed
+
+**Sort Aggregation**:
+- Assumes input sorted by grouping keys
+- Streaming output as groups complete
+- Lower memory footprint
+
+### Aggregation Phases
+
+| Phase | Input | Output | Purpose |
+|-------|-------|--------|---------|
+| Partial | Raw data | Intermediate state | Per-partition aggregation |
+| PartialMerge | Intermediate states | Merged state | Combine after shuffle |
+| Final | Merged state | Final values | Produce output |
+
+### Hash Aggregation Flow
+
+1. **Process batch**: For each input row
+   - Evaluate grouping keys → create binary row key
+   - SIMD hash lookup in `AggHashMap`
+   - If new: insert key, allocate accumulators
+   - If exists: retrieve accumulator index
+   - Update accumulators (sum, count, etc.)
+
+2. **Memory pressure**: When `MemManager` triggers spill
+   - Freeze current hash table to binary format
+   - Write to spill file (compressed)
+   - Start fresh hash table
+
+3. **Output**:
+   - Single table: Direct output in reverse order
+   - Multiple spills: Radix-tree merge by hash bucket
+
+**Key Components:**
+- `AggExec` - Main execution plan
+- `AggHashMap` - SIMD-optimized hash table (64-byte aligned)
+- `AccTable` - Accumulator storage (typed columns)
+- `AggContext` - Schema, modes, partial skipping config
+
+### Partial Skipping Optimization
+
+When cardinality approaches input size (>99.9%), aggregation is skipped:
+- Pass data through unchanged
+- Let downstream handle aggregation
+- Avoids expensive hash table with little reduction
+
+**Code Path:**
+```
+NativeAggBase.doExecuteNative()
+  → AggExecNode (protobuf)
+  → AggExec.execute_agg_with_grouping_hash()
+    → AggTable.process_input_batch()
+      → AggHashMap.upsert_many() [SIMD lookup/insert]
+      → AccTable updates
+    → Spill if memory pressure
+    → AggTable.output() → RecordBatch
+```
+
+---
+
+## Shuffle
+
+Native shuffle writes partitioned data for redistribution across executors.
+
+### Partitioning Schemes
+
+| Scheme | Algorithm | Use Case |
+|--------|-----------|----------|
+| Hash | `murmur3(keys) % n` | Default for joins, aggregations |
+| Range | Binary search in sampled bounds | Sorted output |
+| RoundRobin | `(row_idx + offset) % n` | Load balancing |
+| Single | All to one partition | `collect()`, `coalesce(1)` |
+
+### Shuffle Write Flow
+
+1. **Buffer input batches** (`BufferedData`)
+   - Stage batches until ~4MB threshold
+   - Track memory via `MemManager`
+
+2. **Sort by partition ID**
+   - Evaluate partition for each row
+   - Radix sort all `(partition_id, batch_idx, row_idx)`
+   - Compute partition boundaries
+
+3. **Write output files**
+   - Data file: Compressed Arrow IPC blocks (LZ4/ZSTD)
+   - Index file: 64-bit partition offsets
+
+**Spilling Strategy:**
+- When memory exceeds threshold: flush sorted buffers to disk
+- Multiple spills merged by partition during final write
+- Uses same compression as output
+
+### Range Partitioning
+
+Requires sampling to compute bounds:
+1. Sample key values from input RDD
+2. `RangePartitioner.determineBounds()` computes partition boundaries
+3. Each row → binary search → partition ID
+
+### Output Format
+
+**Data file (.data):**
+```
+[4-byte block length][compressed Arrow IPC][repeat...]
+```
+
+**Index file (.index):**
+```
+i64[0] = 0
+i64[1] = partition 0 end offset
+i64[n] = total file size
+```
+
+**Code Path:**
+```
+NativeShuffleExchangeBase.doExecuteNative()
+  → ShuffleWriterExecNode (protobuf)
+  → ShuffleWriterExec.execute()
+    → SortShuffleRepartitioner.insert_batch()
+      → BufferedData staging/sorting
+    → shuffle_write()
+      → Merge spills if needed
+      → Write data + index files
+```
+
+---
+
+## Memory Management
+
+Auron coordinates memory between JVM and native execution with automatic spilling.
+
+### Memory Budget
+
+```
+executor_memory_overhead × MEMORY_FRACTION (0.6 default)
+         ↓
+    Native Budget
+         ↓
+   Divided among consumers (sort, agg, shuffle, etc.)
+```
+
+### MemManager (Rust Singleton)
+
+Tracks all memory-consuming operators:
+- Maintains total budget and current usage
+- Monitors per-consumer limits
+- Triggers spilling when thresholds exceeded
+
+**Per-Consumer Limit:**
+```
+consumer_max = (total - jvm_direct - unspillable) / num_spillables
+consumer_min = consumer_max / 8
+```
+
+### MemConsumer Trait
+
+Operators implement this to participate in memory management:
+
+```rust
+trait MemConsumer {
+    fn update_mem_used(&self, new_used: usize);
+    fn spill(&self);  // Called when over limit
+}
+```
+
+### Spill Decision Logic
+
+When operator reports memory growth:
+```
+IF total_used > budget AND size > 16MB AND growing:
+    IF spillable AND size > consumer_min:
+        → SPILL immediately
+    ELSE:
+        → WAIT (10 sec timeout, then force spill)
+ELSE:
+    → Continue
+```
+
+### Two-Tier Spilling
+
+**Tier 1: On-Heap (JVM)**
+- Uses Spark's execution memory pool
+- Fast memory-to-memory copy
+- Only when JVM heap < 90% full
+
+**Tier 2: Disk**
+- Compressed temp files (LZ4 default)
+- Used when JVM heap exhausted or on driver
+
+### Operator Integration
+
+**Sort (ExternalSorter):**
+- Tracks in-memory sorted blocks
+- Spill: Merge blocks → write to disk
+- Output: K-way merge of spill files + memory
+
+**Aggregation (AggTable):**
+- Tracks hash table + accumulators
+- Spill: Freeze table → write to disk
+- Output: Radix merge of spill buckets
+
+**Shuffle (BufferedData):**
+- Tracks staged + sorted buffers
+- Spill: Write sorted partition data
+- Output: Merge all spills by partition
+
+### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| `mem_spill_count` | Number of spill events |
+| `mem_spill_size` | Bytes spilled to on-heap |
+| `disk_spill_size` | Bytes spilled to disk |
+| `mem_spill_iotime` | Spill I/O time |
+
+---
 
 # Auron Module Deep Dives
 
-This document provides detailed information about each module in the Auron codebase, including purpose, key files, abstractions, dependencies, and entry points.
+> Detailed documentation of each module with key files, code patterns, and entry points.
 
 ## Module Dependency Graph
 
-```mermaid
-graph TB
-    subgraph JVM["JVM Side"]
-        SE[spark-extension]
-        SS[spark-extension-shims-spark3]
-        AC[auron-core]
-        SS --> SE
-        SE --> AC
-    end
+The JVM side starts in `spark-extension`, which owns plan conversion, expression conversion, and native operator base classes. `spark-extension-shims-spark3` depends on those base classes and supplies Spark-version-specific concrete operators. The Java bridge and configuration code provide the JNI surface used by the Scala wrapper.
 
-    subgraph Rust["Rust Side"]
-        AU[auron]
-        AS[auron-serde]
-        JB[auron-jni-bridge]
-        DEP[datafusion-ext-plans]
-        DEE[datafusion-ext-exprs]
-        DEF[datafusion-ext-functions]
-        DEC[datafusion-ext-commons]
-
-        AU --> JB
-        AU --> AS
-        AU --> DEP
-        DEP --> DEE
-        DEP --> DEF
-        DEP --> DEC
-        DEE --> DEC
-        DEF --> DEC
-        AS --> DEC
-    end
-
-    AC -->|JNI| AU
-    SE -->|Protobuf| AS
-```
+The Rust side starts in `auron`, which owns JNI entry points and runtime lifecycle. It depends on `auron-serde` for Protobuf-to-DataFusion conversion, `auron-jni-bridge` for JNI utilities, and `datafusion-ext-plans` for physical operators. `datafusion-ext-plans` depends on the expression, function, and commons crates for Spark-compatible behavior.
 
 ---
 
@@ -309,7 +504,7 @@ The core Scala module that integrates Auron with Apache Spark. Contains base cla
 | File | Purpose | Start Here? |
 |------|---------|-------------|
 | `auron/AuronSparkSessionExtension.scala` | Main entry point, Spark extension hook | ✅ Yes |
-| `auron/AuronColumnarOverrides.scala` | ColumnarRule that triggers conversion | ✅ Yes |
+| `auron/AuronSparkSessionExtension.scala` (`AuronColumnarOverrides`) | ColumnarRule that triggers conversion | ✅ Yes |
 | `auron/AuronConverters.scala` | Converts SparkPlan to native operators | ✅ Yes |
 | `auron/AuronConvertStrategy.scala` | Analyzes plan convertibility | |
 | `auron/NativeConverters.scala` | Converts expressions to Protobuf | |
@@ -319,43 +514,253 @@ The core Scala module that integrates Auron with Apache Spark. Contains base cla
 | `auron/Shims.scala` | Version abstraction interface | |
 | `execution/auron/plan/*.scala` | Base classes for all native operators | |
 
-### Core Abstractions
+### Key File Details
 
-#### AuronSparkSessionExtension
+#### `auron/AuronSparkSessionExtension.scala`
+
+Main code snippet:
 ```scala
-// spark-extension/.../auron/AuronSparkSessionExtension.scala:30
-class AuronSparkSessionExtension extends (SparkSessionExtensions => Unit) {
+class AuronSparkSessionExtension extends (SparkSessionExtensions => Unit) with Logging {
+  Shims.get.initExtension()
+
   override def apply(extensions: SparkSessionExtensions): Unit = {
-    // Inject columnar override rule
-    extensions.injectColumnar(_ => AuronColumnarOverrides)
+    SparkEnv.get.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "true")
+    SparkEnv.get.conf.set(SQLConf.ADAPTIVE_EXECUTION_FORCE_APPLY.key, "true")
+    Shims.get.onApplyingExtension()
+
+    extensions.injectColumnar(sparkSession => {
+      AuronColumnarOverrides(sparkSession)
+    })
   }
 }
 ```
 
-#### NativeSupports Trait
-```scala
-// spark-extension/.../auron/NativeSupports.scala
-trait NativeSupports extends SparkPlan {
-  // Override this to generate native plan
-  protected def doExecuteNative(): NativeRDD
+Detailed explanation: this is the Spark entry point. Spark loads it from session extension configuration, it forces AQE settings needed by Auron's conversion strategy, initializes Spark-version shims, and injects `AuronColumnarOverrides` so plan conversion happens during Spark's columnar planning phase.
 
-  // Standard execution routes through native
-  override protected def doExecute(): RDD[InternalRow] = doExecuteNative()
-}
-```
+#### `auron/AuronSparkSessionExtension.scala` (`AuronColumnarOverrides`)
 
-#### AuronConverters Object
+Main code snippet:
 ```scala
-// spark-extension/.../auron/AuronConverters.scala:50
-object AuronConverters {
-  // Main entry point for plan conversion
-  def convertSparkPlanRecursively(plan: SparkPlan): SparkPlan = {
-    // Pattern match on SparkPlan types
-    // Convert supported operators to NativeXxxExec
-    // Recursively process children
+case class AuronColumnarOverrides(sparkSession: SparkSession) extends ColumnarRule with Logging {
+  override def preColumnarTransitions: Rule[SparkPlan] = {
+    new Rule[SparkPlan] {
+      override def apply(sparkPlan: SparkPlan): SparkPlan = {
+        if (!sparkPlan.conf.getConf(auronEnabledKey)) {
+          return sparkPlan
+        }
+        AuronConvertStrategy.apply(sparkPlan)
+        AuronConverters.convertSparkPlanRecursively(sparkPlan)
+      }
+    }
   }
 }
 ```
+
+Detailed explanation: this file contains the rule that decides whether a Spark physical plan should be rewritten. It checks `spark.auron.enable`, skips plans that should remain untouched, tags nodes with conversion strategy, and hands the plan to the recursive converter before Spark inserts row/columnar transitions.
+
+#### `auron/AuronConverters.scala`
+
+Main code snippet:
+```scala
+object AuronConverters extends Logging {
+  def convertSparkPlanRecursively(exec: SparkPlan): SparkPlan = {
+    var danglingConverted: Seq[SparkPlan] = Nil
+    exec.foreachUp { exec =>
+      val (newDanglingConverted, newChildren) =
+        danglingConverted.splitAt(danglingConverted.length - exec.children.length)
+
+      var newExec = exec.withNewChildren(newChildren)
+      exec.getTagValue(convertibleTag).foreach(newExec.setTagValue(convertibleTag, _))
+      exec.getTagValue(convertStrategyTag).foreach(newExec.setTagValue(convertStrategyTag, _))
+
+      if (!isNeverConvert(newExec)) {
+        newExec = convertSparkPlan(newExec)
+      }
+      danglingConverted = newDanglingConverted :+ newExec
+    }
+    danglingConverted.head
+  }
+}
+```
+
+Detailed explanation: this is the main SparkPlan rewrite engine. It walks the tree bottom-up, preserves unsupported nodes, and asks `Shims` to create concrete `NativeXxxExec` nodes for supported operators. It also owns special handling for adaptive query stages, shuffle boundaries, native wrappers, and extension conversion providers.
+
+#### `auron/AuronConvertStrategy.scala`
+
+Main code snippet:
+```scala
+object AuronConvertStrategy extends Logging {
+  val convertibleTag = TreeNodeTag[Boolean]("auron.convertible")
+  val convertStrategyTag = TreeNodeTag[AuronConvertStrategy]("auron.convert.strategy")
+
+  def isNeverConvert(exec: SparkPlan): Boolean = {
+    exec.getTagValue(convertStrategyTag).contains(NeverConvert)
+  }
+
+  def isAlwaysConvert(exec: SparkPlan): Boolean = {
+    exec.getTagValue(convertStrategyTag).contains(AlwaysConvert)
+  }
+}
+```
+
+Detailed explanation: this file separates convertibility analysis from the actual rewrite. It tags each `SparkPlan` with whether conversion is allowed, records reasons for non-conversion, and removes native islands that would be slower because their children or consumers would still require row-based Spark execution.
+
+#### `auron/NativeConverters.scala`
+
+Main code snippet:
+```scala
+object NativeConverters extends Logging {
+  def convertExpr(sparkExpr: Expression): pb.PhysicalExprNode = {
+    def fallbackToError: Expression => pb.PhysicalExprNode = { e =>
+      throw new NotImplementedError(s"unsupported expression: (${e.getClass}) $e")
+    }
+
+    try {
+      // try native conversion first
+      convertExprWithFallback(sparkExpr, isPruningExpr = false, fallbackToError)
+    } catch {
+      case e: NotImplementedError =>
+        logWarning(s"Falling back expression: $e")
+        // bind convertible children and wrap the remaining Spark expression as a UDF
+        val exprString = sparkExpr.toString()
+        // fallback wrapper construction continues here
+    }
+  }
+}
+```
+
+Detailed explanation: this file converts Catalyst expressions into Auron Protobuf expression nodes. Operator base classes call it while building `PhysicalPlanNode` messages, so every native filter predicate, projection expression, sort key, join key, and aggregate expression passes through this compatibility layer before Rust sees it.
+
+#### `auron/NativeRDD.scala`
+
+Main code snippet:
+```scala
+class NativeRDD(
+    sc: SparkContext,
+    val metrics: MetricNode,
+    partitions: Array[Partition],
+    partitioner: Option[Partitioner],
+    dependencies: Seq[Dependency[_]],
+    shuffleReadFull: Boolean,
+    val nativePlan: (Partition, TaskContext) => PhysicalPlanNode)
+    extends RDD[InternalRow](sc, dependencies) {
+
+  override def compute(split: Partition, context: TaskContext): Iterator[InternalRow] = {
+    val computingNativePlan = nativePlan(split, context)
+    NativeHelper.executeNativePlan(computingNativePlan, metrics, split, Some(context))
+  }
+}
+```
+
+Detailed explanation: `NativeRDD` is the Spark execution wrapper for native plans. It keeps the Spark partitioning/dependency contract while delaying Protobuf plan construction until a concrete partition is computed, then delegates execution to `NativeHelper`.
+
+#### `auron/NativeHelper.scala`
+
+Main code snippet:
+```scala
+object NativeHelper extends Logging {
+  def executeNativePlan(
+      nativePlan: PhysicalPlanNode,
+      metrics: MetricNode,
+      partition: Partition,
+      context: Option[TaskContext]): Iterator[InternalRow] = {
+    if (nativePlan == null) {
+      return Iterator.empty
+    }
+    AuronCallNativeWrapper(nativePlan, partition, context, metrics).getRowIterator
+  }
+}
+```
+
+Detailed explanation: this file centralizes runtime helpers used by native operators. It creates wrappers for native execution, exposes configured native memory limits, builds standard metrics, and hides the JNI wrapper lifecycle from individual operator implementations.
+
+#### `auron/AuronCallNativeWrapper.scala`
+
+Main code snippet:
+```scala
+case class AuronCallNativeWrapper(
+    nativePlan: PhysicalPlanNode,
+    partition: Partition,
+    context: Option[TaskContext],
+    metrics: MetricNode)
+    extends Logging {
+
+  AuronCallNativeWrapper.initNative()
+
+  private var nativeRuntimePtr =
+    JniBridge.callNative(NativeHelper.nativeMemory, AuronConf.NATIVE_LOG_LEVEL.stringConf(), this)
+
+  private lazy val rowIterator = new Iterator[InternalRow] {
+    override def hasNext: Boolean = {
+      if (batchCurRowIdx < batchRows.length) {
+        return true
+      }
+      batchRows.clear()
+      batchCurRowIdx = 0
+      nativeRuntimePtr != 0 && JniBridge.nextBatch(nativeRuntimePtr) && hasNext
+    }
+
+    override def next(): InternalRow = {
+      val batchRow = batchRows(batchCurRowIdx)
+      batchCurRowIdx += 1
+      batchRow
+    }
+  }
+
+  def getRowIterator: Iterator[InternalRow] =
+    CompletionIterator[InternalRow, Iterator[InternalRow]](rowIterator, close())
+}
+```
+
+Detailed explanation: this wrapper owns one native task execution from the JVM side. It loads the native library, calls into Rust, receives Arrow FFI callbacks, converts imported Arrow data into Spark rows, updates metrics, and finalizes the native runtime pointer when the Spark iterator closes.
+
+#### `auron/Shims.scala`
+
+Main code snippet:
+```scala
+abstract class Shims {
+  def initExtension(): Unit
+  def onApplyingExtension(): Unit
+
+  def createNativeFilterExec(condition: Expression, child: SparkPlan): NativeFilterBase
+  def createNativeProjectExec(projectList: Seq[NamedExpression], child: SparkPlan): NativeProjectBase
+}
+```
+
+Detailed explanation: `Shims` is the compatibility interface between common Auron conversion logic and Spark-version-specific classes. The common converter never directly constructs Spark 3.x concrete operators; it calls this interface so each supported Spark version can handle constructor and API differences.
+
+#### `execution/auron/plan/*.scala`
+
+Main code snippet:
+```scala
+abstract class NativeFilterBase(condition: Expression, override val child: SparkPlan)
+    extends UnaryExecNode
+    with NativeSupports {
+
+  override def doExecuteNative(): NativeRDD = {
+    val inputRDD = NativeHelper.executeNative(child)
+    val nativeMetrics = MetricNode(metrics, inputRDD.metrics :: Nil)
+    val nativeFilterExprs = this.nativeFilterExprs
+    new NativeRDD(
+      sparkContext,
+      nativeMetrics,
+      rddPartitions = inputRDD.partitions,
+      rddPartitioner = inputRDD.partitioner,
+      rddDependencies = new OneToOneDependency(inputRDD) :: Nil,
+      inputRDD.isShuffleReadFull,
+      (partition, taskContext) => {
+        val inputPartition = inputRDD.partitions(partition.index)
+        val nativeFilterExec = FilterExecNode.newBuilder()
+          .setInput(inputRDD.nativePlan(inputPartition, taskContext))
+          .addAllExpr(nativeFilterExprs.asJava)
+          .build()
+        PhysicalPlanNode.newBuilder().setFilter(nativeFilterExec).build()
+      })
+  }
+}
+```
+
+Detailed explanation: the plan package contains the shared base classes for native Spark operators. Each base class preserves Spark metadata such as output schema, ordering, partitioning, and metrics while implementing `doExecuteNative()` to build the Protobuf operator node consumed by Rust.
 
 ### Dependencies
 - **Depends on**: Apache Spark core, auron-core
@@ -383,34 +788,43 @@ Contains Spark 3.x version-specific implementations of native operators. Handles
 | `auron/ShimsImpl.scala` | Version-specific factory implementation | ✅ Yes |
 | `execution/auron/plan/*.scala` | Concrete operator implementations | ✅ Yes |
 
-### Core Abstractions
+### Key File Details
 
-#### ShimsImpl
+#### `auron/ShimsImpl.scala`
+
+Main code snippet:
 ```scala
-// spark-extension-shims-spark3/.../auron/ShimsImpl.scala
 class ShimsImpl extends Shims {
-  // Factory methods for all native operators
   override def createNativeFilterExec(condition: Expression, child: SparkPlan): SparkPlan =
     NativeFilterExec(condition, child)
 
-  override def createNativeProjectExec(projectList: Seq[NamedExpression], child: SparkPlan): SparkPlan =
+  override def createNativeProjectExec(
+      projectList: Seq[NamedExpression],
+      child: SparkPlan): SparkPlan =
     NativeProjectExec(projectList, child)
-
-  // ... factories for all operators
 }
 ```
 
-#### Concrete Operators
+Detailed explanation: this Spark 3 shim implements the common `Shims` interface with concrete Spark 3 operator classes. When `AuronConverters` decides a plan node should become native, `ShimsImpl` supplies the actual `NativeXxxExec` class that matches the active Spark API.
+
+#### `execution/auron/plan/*.scala`
+
+Main code snippet:
 ```scala
-// spark-extension-shims-spark3/.../plan/NativeFilterExec.scala
 case class NativeFilterExec(condition: Expression, override val child: SparkPlan)
     extends NativeFilterBase(condition, child) {
 
-  // Spark 3.2+ requires withNewChildInternal
+  @sparkver("3.2 / 3.3 / 3.4 / 3.5")
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
     copy(child = newChild)
+
+  @sparkver("3.0 / 3.1")
+  override def withNewChildren(newChildren: Seq[SparkPlan]): SparkPlan =
+    copy(child = newChildren.head)
 }
 ```
+
+Detailed explanation: the shim plan package contains thin concrete operator classes that extend the shared base classes from `spark-extension`. Their main job is to satisfy Spark-version-specific tree-copying and constructor requirements while leaving native plan generation in the common base classes.
 
 ### Version Differences Handled
 - `withNewChildInternal()` (Spark 3.2+) vs `withNewChildren()` (Spark 3.0/3.1)
@@ -442,67 +856,95 @@ Defines the Protocol Buffer schema for serializing execution plans and expressio
 |------|---------|-------------|
 | `proto/auron.proto` | Main Protobuf schema definition | ✅ Yes |
 | `src/from_proto.rs` | Deserialize Protobuf to Rust types | ✅ Yes |
-| `src/to_proto.rs` | Serialize Rust types to Protobuf | |
 | `src/lib.rs` | Module exports | |
 | `build.rs` | Code generation during build | |
 
-### Core Abstractions
+### Key File Details
 
-#### PhysicalPlanNode (Protobuf)
+#### `proto/auron.proto`
+
+Main code snippet:
 ```protobuf
-// native-engine/auron-serde/proto/auron.proto:50
 message PhysicalPlanNode {
   oneof PhysicalPlanType {
-    FilterExecNode filter = 8;
-    ProjectionExecNode projection = 7;
-    SortExecNode sort = 9;
-    AggExecNode agg = 17;
-    SortMergeJoinExecNode sort_merge_join = 13;
-    HashJoinExecNode hash_join = 14;
-    ParquetScanExecNode parquet_scan = 5;
-    OrcScanExecNode orc_scan = 6;
     ShuffleWriterExecNode shuffle_writer = 2;
-    // ... 20+ operator types
+    ParquetScanExecNode parquet_scan = 5;
+    ProjectionExecNode projection = 6;
+    SortExecNode sort = 7;
+    FilterExecNode filter = 8;
+    AggExecNode agg = 16;
+    WindowExecNode window = 22;
+    OrcScanExecNode orc_scan = 25;
   }
 }
 ```
 
-#### PhysicalExprNode (Protobuf)
-```protobuf
-// native-engine/auron-serde/proto/auron.proto:150
-message PhysicalExprNode {
-  oneof ExprType {
-    PhysicalColumn column = 1;
-    ScalarValue literal = 2;
-    PhysicalBinaryExprNode binary_expr = 4;
-    PhysicalCastNode cast = 6;
-    PhysicalCaseNode case_ = 8;
-    PhysicalScalarFunctionNode scalar_function = 9;
-    PhysicalAggExprNode agg_expr = 10;
-    // ... 30+ expression types
-  }
-}
-```
+Detailed explanation: this schema is the wire contract between Scala and Rust. Scala operator base classes build these messages, Java serializes them as part of `TaskDefinition`, and Rust deserializes them into DataFusion operators. Adding a native operator or expression requires extending this schema first.
 
-#### from_proto Module
+#### `src/from_proto.rs`
+
+Main code snippet:
 ```rust
-// native-engine/auron-serde/src/from_proto.rs:100
-pub fn convert_physical_plan(
-    plan: &PhysicalPlanNode,
-    ctx: &SessionContext,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    match &plan.physical_plan_type {
-        Some(PhysicalPlanType::Filter(filter)) => {
-            let input = convert_physical_plan(filter.input.as_ref().unwrap(), ctx)?;
-            let predicates = filter.expr.iter()
-                .map(|e| convert_physical_expr(e, input.schema()))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(FilterExec::new(predicates, input)))
+impl TryInto<Arc<dyn ExecutionPlan>> for &protobuf::PhysicalPlanNode {
+    type Error = PlanSerDeError;
+
+    fn try_into(self) -> Result<Arc<dyn ExecutionPlan>, Self::Error> {
+        let plan = self.physical_plan_type.as_ref().ok_or_else(|| {
+            proto_error(format!("unsupported physical plan '{:?}'", self))
+        })?;
+        match plan {
+            PhysicalPlanType::Projection(projection) => { /* build ProjectExec */ }
+            PhysicalPlanType::Filter(filter) => { /* build FilterExec */ }
+            PhysicalPlanType::Agg(agg) => { /* build AggExec */ }
+            _ => { /* other operators */ }
         }
-        // ... match arms for all operator types
     }
 }
 ```
+
+Detailed explanation: this is the Rust deserialization layer for physical plans and expressions. It validates required Protobuf fields, converts nested inputs recursively, maps Spark-compatible expression/function names, and returns concrete `Arc<dyn ExecutionPlan>` values for the native runtime.
+
+#### `src/lib.rs`
+
+Main code snippet:
+```rust
+pub mod protobuf {
+    include!(concat!(env!("OUT_DIR"), "/plan.protobuf.rs"));
+}
+
+pub mod error;
+pub mod from_proto;
+
+#[macro_export]
+macro_rules! convert_box_required {
+    ($PB:expr) => {{
+        if let Some(field) = $PB.as_ref() {
+            field.as_ref().try_into()
+        } else {
+            Err(proto_error("Missing required field in protobuf"))
+        }
+    }};
+}
+```
+
+Detailed explanation: `lib.rs` exposes generated Protobuf types, the `from_proto` module, serde errors, and helper macros for required-field conversion. The generated Rust code is included from Cargo's build output, keeping checked-in source focused on conversion logic.
+
+#### `build.rs`
+
+Main code snippet:
+```rust
+fn main() -> Result<(), String> {
+    println!("cargo:rerun-if-env-changed=FORCE_REBUILD");
+    println!("cargo:rerun-if-changed=proto/auron.proto");
+
+    let mut prost_build = tonic_build::Config::new();
+    prost_build
+        .compile_protos(&["proto/auron.proto"], &["proto"])
+        .map_err(|e| format!("protobuf compilation failed: {}", e))
+}
+```
+
+Detailed explanation: this Cargo build script generates Rust Protobuf bindings from `proto/auron.proto`. It also supports the repository's Maven-provided `protoc` path, making native builds align with the Java/Scala Protobuf generation pipeline.
 
 ### Dependencies
 - **Depends on**: datafusion-ext-commons, prost (protobuf library)
@@ -533,8 +975,84 @@ Provides the Java interface for calling into native Rust code via JNI.
 |------|---------|-------------|
 | `jni/JniBridge.java` | JNI native method declarations | ✅ Yes |
 | `jni/AuronAdaptor.java` | Abstract adaptor for Auron engine | ✅ Yes |
-| `conf/AuronConf.java` | Configuration handling | |
+| `configuration/AuronConfiguration.java` | Engine configuration interface | |
 | `memory/OnHeapSpillManager.java` | JVM memory management | |
+
+#### Key File Details
+
+##### `jni/JniBridge.java`
+
+Main code snippet:
+```java
+public class JniBridge {
+    public static native long callNative(
+            long initNativeMemory,
+            String logLevel,
+            AuronCallNativeWrapper wrapper);
+
+    public static native boolean nextBatch(long ptr);
+    public static native void finalizeNative(long ptr);
+    public static native void onExit();
+}
+```
+
+Detailed explanation: this class declares the JVM methods implemented by Rust JNI symbols. It also exposes callback helpers Rust needs, including resource lookup, Hadoop file wrappers, direct-memory usage, task-running checks, and access to the current `OnHeapSpillManager`.
+
+##### `jni/AuronAdaptor.java`
+
+Main code snippet:
+```java
+public abstract class AuronAdaptor {
+    private static AuronAdaptor INSTANCE = null;
+
+    public static synchronized void initInstance(AuronAdaptor auronAdaptor) {
+        if (INSTANCE == null) {
+            INSTANCE = auronAdaptor;
+        }
+    }
+
+    public abstract void loadAuronLib();
+    public abstract AuronConfiguration getAuronConfiguration();
+}
+```
+
+Detailed explanation: `AuronAdaptor` is the Java-side embedding interface for the native engine. Spark-specific code installs an implementation that knows how to load the native library, expose engine configuration, report memory limits, provide spill management, and create UDF wrapper contexts.
+
+##### `configuration/AuronConfiguration.java`
+
+Main code snippet:
+```java
+public abstract class AuronConfiguration {
+    public static final ConfigOption<Integer> BATCH_SIZE =
+            ConfigOptions.key("auron.batchSize").intType().defaultValue(10000);
+
+    public static final ConfigOption<Double> MEMORY_FRACTION =
+            ConfigOptions.key("auron.memoryFraction").doubleType().defaultValue(0.6);
+
+    public abstract <T> Optional<T> getOptional(ConfigOption<T> option);
+
+    public <T> T get(ConfigOption<T> option) {
+        return getOptional(option).orElseGet(option::defaultValue);
+    }
+}
+```
+
+Detailed explanation: this interface abstracts configuration lookup for Java and Rust callback code. The native side can request Spark/Auron settings through JNI without depending directly on Spark's `SparkConf` implementation.
+
+##### `memory/OnHeapSpillManager.java`
+
+Main code snippet:
+```java
+public abstract class OnHeapSpillManager {
+    abstract boolean isOnHeapAvailable();
+    abstract int newSpill();
+    abstract void writeSpill(int spillId, ByteBuffer buffer);
+    abstract int readSpill(int spillId, ByteBuffer buffer);
+    abstract void releaseSpill(int spillId);
+}
+```
+
+Detailed explanation: this class is the JVM spill contract used by native code when data must be staged through Spark-managed on-heap resources. The disabled implementation throws for spill operations; Spark integrations provide a real task-scoped manager when on-heap spilling is available.
 
 #### Core Abstractions
 
@@ -573,6 +1091,51 @@ Rust utilities for JNI interop: thread-local JNI environment, local reference ma
 | `jni_bridge.rs` | JNI utilities and thread-local env | ✅ Yes |
 | `lib.rs` | Module exports | |
 
+#### Key File Details
+
+##### `jni_bridge.rs`
+
+Main code snippet:
+```rust
+thread_local! {
+    pub static THREAD_JNIENV: RefCell<Option<*mut JNIEnv>> = RefCell::new(None);
+}
+
+pub struct JavaClasses {
+    pub classloader: GlobalRef,
+    pub jni_bridge: GlobalRef,
+    pub auron_call_native_wrapper: GlobalRef,
+    pub runtime_exception: GlobalRef,
+}
+```
+
+Detailed explanation: this file owns the low-level JNI utility layer used by Rust. It stores the thread-local `JNIEnv`, caches Java class and method references, and defines macros/helpers that make Rust-to-Java calls concise while preserving exception handling.
+
+##### `lib.rs`
+
+Main code snippet:
+```rust
+pub mod conf;
+pub mod jni_bridge;
+
+pub fn ensure_jni_bridge_inited() -> Result<()> {
+    if is_jni_bridge_inited() {
+        Ok(())
+    } else {
+        Err(DataFusionError::Execution("JNIEnv not initialized".to_string()))
+    }
+}
+
+pub fn is_task_running() -> bool {
+    if !is_jni_bridge_inited() {
+        return true;
+    }
+    is_task_running_impl().expect("calling JniBridge.isTaskRunning() error")
+}
+```
+
+Detailed explanation: `lib.rs` exposes JNI bridge modules and task-state helpers to the rest of the native engine. Operators and runtime code call these helpers to ensure JNI has been initialized and to stop native work when Spark cancels or completes a task.
+
 #### Core Abstractions
 
 ```rust
@@ -597,31 +1160,7 @@ pub struct JavaClasses {
 ```
 
 ### JNI Call Flow
-```
-JVM                                 Rust
- │                                   │
- │  JniBridge.callNative()          │
- │ ─────────────────────────────────▶│
- │                                   │ Java_org_apache_spark_sql_auron_
- │                                   │   JniBridge_callNative()
- │                                   │ ─────▶ init_jni_bridge()
- │                                   │ ─────▶ create NativeExecutionRuntime
- │  returns: long (runtime ptr)      │
- │ ◀─────────────────────────────────│
- │                                   │
- │  JniBridge.nextBatch(ptr)        │
- │ ─────────────────────────────────▶│
- │                                   │ execute_plan()
- │                                   │ produce Arrow batch
- │                                   │ call wrapper.importBatch()
- │  returns: boolean (has more)      │
- │ ◀─────────────────────────────────│
- │                                   │
- │  JniBridge.finalizeNative(ptr)   │
- │ ─────────────────────────────────▶│
- │                                   │ drop NativeExecutionRuntime
- │ ◀─────────────────────────────────│
-```
+`JniBridge.callNative()` initializes the Rust-side JNI bridge on first use, configures logging and DataFusion session state, creates a `NativeExecutionRuntime`, and returns its raw pointer as a JVM `long`. `JniBridge.nextBatch(ptr)` asks that runtime for the next Arrow batch and calls back into `AuronCallNativeWrapper.importBatch()` to hand the FFI pointers to the JVM. `JniBridge.finalizeNative(ptr)` consumes the pointer and drops the runtime so Rust resources are released.
 
 ### Dependencies
 - **Java depends on**: JNI libraries
@@ -642,51 +1181,110 @@ Main Rust crate that coordinates native execution. Contains JNI entry points, ru
 
 | File | Purpose | Start Here? |
 |------|---------|-------------|
-| `lib.rs` | JNI entry points, runtime init | ✅ Yes |
+| `lib.rs` | Panic handling and module wiring | |
 | `rt.rs` | NativeExecutionRuntime definition | ✅ Yes |
-| `exec.rs` | Plan execution logic | |
+| `exec.rs` | JNI entry points and runtime creation | ✅ Yes |
 | `logging.rs` | Logging configuration | |
 
-### Core Abstractions
+### Key File Details
 
-#### JNI Entry Point
+#### `lib.rs`
+
+Main code snippet:
 ```rust
-// native-engine/auron/src/lib.rs:50
-#[no_mangle]
+mod alloc;
+mod exec;
+mod logging;
+mod metrics;
+mod rt;
+
+fn handle_unwinded_scope<T: Default, E: Debug>(scope: impl FnOnce() -> Result<T, E>) -> T {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| scope().unwrap())) {
+        Ok(v) => v,
+        Err(err) => {
+            handle_unwinded(err);
+            T::default()
+        }
+    }
+}
+```
+
+Detailed explanation: this file wires the native runtime modules together and provides shared panic-handling helpers for JNI entry points. The exported JNI functions live in `exec.rs`, but they use `handle_unwinded_scope()` from this file so Rust panics become JVM exceptions instead of unwinding across JNI.
+
+#### `rt.rs`
+
+Main code snippet:
+```rust
+pub struct NativeExecutionRuntime {
+    exec_ctx: Arc<ExecutionContext>,
+    native_wrapper: GlobalRef,
+    plan: Arc<dyn ExecutionPlan>,
+    batch_receiver: Receiver<Result<Option<RecordBatch>>>,
+    tokio_runtime: Runtime,
+    join_handle: JoinHandle<()>,
+}
+
+impl NativeExecutionRuntime {
+    pub fn start(native_wrapper: GlobalRef, context: Arc<TaskContext>) -> Result<Self> {
+        let task_definition = TaskDefinition::decode(raw_task_definition.as_slice())?;
+        let execution_plan: Arc<dyn ExecutionPlan> = plan.try_into()?;
+        // start async execution and return the runtime holder
+    }
+}
+```
+
+Detailed explanation: `rt.rs` owns the lifetime of one native task. It decodes the JVM-provided task definition, turns the Protobuf plan into a DataFusion plan, starts execution on a Tokio runtime, receives output batches, and calls back into the JVM wrapper for Arrow FFI import.
+
+#### `exec.rs`
+
+Main code snippet:
+```rust
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_apache_spark_sql_auron_JniBridge_callNative(
     env: JNIEnv,
-    _class: JClass,
+    _: JClass,
     executor_memory_overhead: i64,
     log_level: JString,
     native_wrapper: JObject,
 ) -> i64 {
-    // 1. Initialize JNI bridge
-    // 2. Create DataFusion SessionContext
-    // 3. Create NativeExecutionRuntime
-    // 4. Return pointer as i64
+    handle_unwinded_scope(|| -> Result<i64> {
+        JavaClasses::init(&env);
+        MemManager::init((executor_memory_overhead as f64 * memory_fraction) as usize);
+        let runtime = Box::new(NativeExecutionRuntime::start(native_wrapper, task_ctx)?);
+        Ok(Box::into_raw(runtime) as usize as i64)
+    })
+}
+
+pub extern "system" fn Java_org_apache_spark_sql_auron_JniBridge_nextBatch(
+    _: JNIEnv,
+    _: JClass,
+    raw_ptr: i64,
+) -> bool {
+    let runtime = unsafe { &*(raw_ptr as usize as *const NativeExecutionRuntime) };
+    runtime.next_batch()
 }
 ```
 
-#### NativeExecutionRuntime
+Detailed explanation: this file contains the JNI methods Java calls after loading the native library. It initializes the native environment on the first `callNative()`, creates `NativeExecutionRuntime`, drives the stream one batch at a time through `nextBatch()`, and finalizes runtime pointers when the JVM asks for cleanup.
+
+#### `logging.rs`
+
+Main code snippet:
 ```rust
-// native-engine/auron/src/rt.rs:30
-pub struct NativeExecutionRuntime {
-    // DataFusion session with configuration
-    pub session_ctx: SessionContext,
+thread_local! {
+    pub static THREAD_TID: Cell<usize> = Cell::new(0);
+    pub static THREAD_STAGE_ID: Cell<usize> = Cell::new(0);
+    pub static THREAD_PARTITION_ID: Cell<usize> = Cell::new(0);
+}
 
-    // The execution plan to run
-    pub plan: Arc<dyn ExecutionPlan>,
-
-    // Current partition being processed
-    pub partition: usize,
-
-    // Batch stream from execution
-    pub stream: Option<SendableRecordBatchStream>,
-
-    // JNI callback wrapper
-    pub native_wrapper: GlobalRef,
+pub fn init_logging(level: &str) {
+    let log_level = Level::from_str(level).unwrap_or(DEFAULT_MAX_LEVEL);
+    log::set_max_level(LevelFilter::Info);
 }
 ```
+
+Detailed explanation: native logging is initialized once and enriches log lines with task, stage, and partition identifiers. Runtime worker threads set those thread-local values so native logs can be correlated with Spark task execution.
 
 ### Dependencies
 - **Depends on**: auron-serde, auron-jni-bridge, datafusion-ext-plans, DataFusion
@@ -713,7 +1311,7 @@ Custom DataFusion physical plan operators and expressions that extend DataFusion
 |-------|-----------|---------|
 | **datafusion-ext-plans** | | |
 | | `lib.rs` | Module exports |
-| | `agg/agg_exec.rs` | Hash/Sort aggregation |
+| | `agg_exec.rs` | Hash/Sort aggregation |
 | | `filter_exec.rs` | Filter execution |
 | | `project_exec.rs` | Projection execution |
 | | `sort_exec.rs` | Sort execution |
@@ -721,64 +1319,322 @@ Custom DataFusion physical plan operators and expressions that extend DataFusion
 | | `broadcast_join_exec.rs` | Broadcast join |
 | | `shuffle_writer_exec.rs` | Shuffle write |
 | | `parquet_exec.rs` | Parquet scan |
-| | `window/` | Window functions |
-| | `memmgr/` | Memory management |
+| | `window_exec.rs` and `window/` | Window functions |
+| | `memmgr/mod.rs` | Memory management |
 | **datafusion-ext-exprs** | | |
 | | `lib.rs` | Expression exports |
 | | `cast.rs` | Cast expressions |
-| | `string_funcs.rs` | String functions |
-| | `datetime_funcs.rs` | Date/time functions |
+| | `string_contains.rs`, `string_starts_with.rs`, `string_ends_with.rs` | String predicates |
 | **datafusion-ext-functions** | | |
 | | `lib.rs` | SQL function registry |
 | **datafusion-ext-commons** | | |
 | | `lib.rs` | Shared utilities |
 
-### Core Abstractions
+### Key File Details
 
-#### Custom ExecutionPlan
+#### `datafusion-ext-plans/src/lib.rs`
+
+Main code snippet:
 ```rust
-// native-engine/datafusion-ext-plans/src/filter_exec.rs:20
+pub mod agg;
+pub mod agg_exec;
+pub mod broadcast_join_exec;
+pub mod filter_exec;
+pub mod parquet_exec;
+pub mod project_exec;
+pub mod shuffle_writer_exec;
+pub mod sort_exec;
+pub mod sort_merge_join_exec;
+pub mod window_exec;
+
+pub mod memmgr;
+pub mod common;
+pub mod shuffle;
+pub mod window;
+```
+
+Detailed explanation: this crate root exposes Auron's custom DataFusion physical operators and helper modules. `auron-serde` imports these modules when turning Protobuf nodes into executable plans, so new native operators must be exported here before they can be deserialized.
+
+#### `datafusion-ext-plans/src/agg_exec.rs`
+
+Main code snippet:
+```rust
 #[derive(Debug)]
-pub struct FilterExec {
-    /// Filter predicates
-    predicates: Vec<Arc<dyn PhysicalExpr>>,
-    /// Input execution plan
+pub struct AggExec {
     input: Arc<dyn ExecutionPlan>,
-    /// Output schema (same as input for filter)
-    schema: SchemaRef,
-    /// Metrics
+    agg_ctx: Arc<AggContext>,
     metrics: ExecutionPlanMetricsSet,
+    props: OnceCell<PlanProperties>,
 }
 
-impl ExecutionPlan for FilterExec {
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        // Execute input plan
-        // Apply filter predicates to each batch
-        // Return filtered stream
+impl AggExec {
+    pub fn try_new(
+        exec_mode: AggExecMode,
+        groupings: Vec<GroupingExpr>,
+        aggs: Vec<AggExpr>,
+        supports_partial_skipping: bool,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Result<Self> {
+        let agg_ctx = Arc::new(AggContext::try_new(exec_mode, input.schema(), groupings, aggs, supports_partial_skipping, false)?);
+        Ok(Self { input, agg_ctx, metrics: ExecutionPlanMetricsSet::new(), props: OnceCell::new() })
     }
 }
 ```
 
-#### Aggregation System
+Detailed explanation: `AggExec` implements native hash and sort aggregation. It builds an `AggContext` from grouping and aggregate expressions, manages aggregate state through the `agg` submodule, integrates with native memory management, and emits DataFusion-compatible record batches.
+
+#### `datafusion-ext-plans/src/filter_exec.rs`
+
+Main code snippet:
 ```rust
-// native-engine/datafusion-ext-plans/src/agg/agg_exec.rs:50
-pub enum AggExecMode {
-    HashAgg,  // Hash-based aggregation
-    SortAgg,  // Sort-based aggregation
+#[derive(Debug, Clone)]
+pub struct FilterExec {
+    input: Arc<dyn ExecutionPlan>,
+    predicates: Vec<PhysicalExprRef>,
+    metrics: ExecutionPlanMetricsSet,
+    props: OnceCell<PlanProperties>,
 }
 
-pub struct AggExec {
-    mode: AggExecMode,
-    group_by: Vec<Arc<dyn PhysicalExpr>>,
-    aggr_exprs: Vec<Arc<dyn AggregateExpr>>,
-    input: Arc<dyn ExecutionPlan>,
-    // ...
+impl FilterExec {
+    pub fn try_new(predicates: Vec<PhysicalExprRef>, input: Arc<dyn ExecutionPlan>) -> Result<Self> {
+        if predicates.is_empty() {
+            df_execution_err!("Filter requires at least one predicate")?;
+        }
+        Ok(Self { input, predicates, metrics: ExecutionPlanMetricsSet::new(), props: OnceCell::new() })
+    }
 }
 ```
+
+Detailed explanation: the native filter operator validates boolean predicates, executes its input stream, evaluates predicates against each Arrow batch, and returns only matching rows. It also participates in column pruning when downstream operators do not require every input column.
+
+#### `datafusion-ext-plans/src/project_exec.rs`
+
+Main code snippet:
+```rust
+#[derive(Debug, Clone)]
+pub struct ProjectExec {
+    expr: Vec<(PhysicalExprRef, String)>,
+    input: Arc<dyn ExecutionPlan>,
+    schema: SchemaRef,
+    metrics: ExecutionPlanMetricsSet,
+    props: OnceCell<PlanProperties>,
+}
+
+impl ProjectExec {
+    pub fn try_new(expr: Vec<(PhysicalExprRef, String)>, input: Arc<dyn ExecutionPlan>) -> Result<Self> {
+        let input_schema = input.schema();
+        let schema = Arc::new(Schema::new(expr.iter().map(|(e, name)| {
+            Ok(Field::new(name, e.data_type(&input_schema)?, e.nullable(&input_schema)?))
+        }).collect::<Result<Fields>>()?));
+        Ok(Self { expr, input, schema, metrics: ExecutionPlanMetricsSet::new(), props: OnceCell::new() })
+    }
+}
+```
+
+Detailed explanation: `ProjectExec` evaluates native expressions and constructs the output Arrow schema from expression data types and nullability. It is used for Spark projections, computed columns, and intermediate projections inserted to support pruning or operator-specific layouts.
+
+#### `datafusion-ext-plans/src/sort_exec.rs`
+
+Main code snippet:
+```rust
+pub struct SortExec {
+    input: Arc<dyn ExecutionPlan>,
+    exprs: Vec<PhysicalSortExpr>,
+    fetch: Option<usize>,
+    metrics: ExecutionPlanMetricsSet,
+    record_output: bool,
+    props: OnceCell<PlanProperties>,
+}
+```
+
+Detailed explanation: this file implements native sort with memory-aware buffering and spill support. It evaluates sort keys, stores sorted blocks in memory or spill files, and performs k-way merge when needed to produce globally ordered Arrow batches.
+
+#### `datafusion-ext-plans/src/sort_merge_join_exec.rs`
+
+Main code snippet:
+```rust
+pub struct SortMergeJoinExec {
+    left: Arc<dyn ExecutionPlan>,
+    right: Arc<dyn ExecutionPlan>,
+    on: JoinOn,
+    join_type: JoinType,
+    sort_options: Vec<SortOptions>,
+    schema: SchemaRef,
+    metrics: ExecutionPlanMetricsSet,
+    props: OnceCell<PlanProperties>,
+}
+```
+
+Detailed explanation: this operator performs Spark-compatible sort-merge joins over sorted left and right streams. It owns join-key comparison, stream cursor management, join-type behavior, output projection, and metrics for matched/unmatched rows.
+
+#### `datafusion-ext-plans/src/broadcast_join_exec.rs`
+
+Main code snippet:
+```rust
+pub struct BroadcastJoinExec {
+    left: Arc<dyn ExecutionPlan>,
+    right: Arc<dyn ExecutionPlan>,
+    on: JoinOn,
+    join_type: JoinType,
+    broadcast_side: JoinSide,
+    schema: SchemaRef,
+    metrics: ExecutionPlanMetricsSet,
+    props: OnceCell<PlanProperties>,
+}
+```
+
+Detailed explanation: broadcast join reads a prebuilt small-side relation and probes it from the streamed side. This file coordinates build/probe schemas, join projection, join type semantics, and column pruning for native broadcast hash join execution.
+
+#### `datafusion-ext-plans/src/shuffle_writer_exec.rs`
+
+Main code snippet:
+```rust
+pub struct ShuffleWriterExec {
+    input: Arc<dyn ExecutionPlan>,
+    partitioning: Partitioning,
+    output_data_file: String,
+    output_index_file: String,
+    metrics: ExecutionPlanMetricsSet,
+    props: OnceCell<PlanProperties>,
+}
+```
+
+Detailed explanation: this operator writes native shuffle output for Spark stages. It evaluates partitioning, repartitions Arrow batches, writes IPC/compressed blocks, and reports shuffle metrics back through Spark's native wrapper.
+
+#### `datafusion-ext-plans/src/parquet_exec.rs`
+
+Main code snippet:
+```rust
+pub struct ParquetExec {
+    fs_resource_id: String,
+    base_config: FileScanConfig,
+    projected_statistics: Statistics,
+    projected_schema: SchemaRef,
+    predicate: Option<PhysicalExprRef>,
+    metrics: ExecutionPlanMetricsSet,
+    props: OnceCell<PlanProperties>,
+}
+```
+
+Detailed explanation: native Parquet scan builds DataFusion file-scan configuration from Spark file metadata. It applies projection, predicate pushdown, schema adaptation, metrics collection, and Hadoop filesystem access through JNI-backed wrappers.
+
+#### `datafusion-ext-plans/src/window_exec.rs` and `window/`
+
+Main code snippet:
+```rust
+pub struct WindowExec {
+    input: Arc<dyn ExecutionPlan>,
+    context: Arc<WindowContext>,
+    metrics: ExecutionPlanMetricsSet,
+    props: OnceCell<PlanProperties>,
+}
+```
+
+Detailed explanation: `window_exec.rs` is the physical operator wrapper and `window/` contains the implementation details for window contexts and functions. Together they evaluate partitioned, ordered window expressions such as rank-like functions while preserving Spark output schema expectations.
+
+#### `datafusion-ext-plans/src/memmgr/mod.rs`
+
+Main code snippet:
+```rust
+pub struct MemManager {
+    total: usize,
+    consumers: Mutex<Vec<Arc<MemConsumerInfo>>>,
+    status: Mutex<MemManagerStatus>,
+    cv: Condvar,
+}
+
+impl MemManager {
+    pub fn init(total: usize) {
+        MEM_MANAGER.get_or_init(|| Arc::new(MemManager {
+            total,
+            consumers: Mutex::default(),
+            status: Mutex::default(),
+            cv: Condvar::default(),
+        }));
+    }
+}
+```
+
+Detailed explanation: `MemManager` is the native memory coordinator. Sort, aggregation, and shuffle consumers register with it, reserve memory before growing buffers, and trigger spill behavior when usage approaches the configured native memory limit.
+
+#### `datafusion-ext-exprs/src/lib.rs`
+
+Main code snippet:
+```rust
+pub mod bloom_filter_might_contain;
+pub mod cast;
+pub mod get_indexed_field;
+pub mod get_map_value;
+pub mod named_struct;
+pub mod row_num;
+pub mod spark_udf_wrapper;
+pub mod string_contains;
+pub mod string_ends_with;
+pub mod string_starts_with;
+```
+
+Detailed explanation: this crate exposes physical expression implementations that DataFusion does not provide with Spark-compatible behavior. `from_proto.rs` constructs these expressions for casts, nested-field access, string predicates, row numbers, scalar subqueries, and Spark UDF callbacks.
+
+#### `datafusion-ext-exprs/src/cast.rs`
+
+Main code snippet:
+```rust
+pub struct TryCastExpr {
+    expr: PhysicalExprRef,
+    cast_type: DataType,
+}
+```
+
+Detailed explanation: cast support handles Spark-specific conversion behavior that differs from vanilla DataFusion. The serde layer uses these expressions when Spark plans contain `CAST` or `TRY_CAST` nodes that need native evaluation.
+
+#### `datafusion-ext-exprs/src/string_contains.rs`, `string_starts_with.rs`, `string_ends_with.rs`
+
+Main code snippet:
+```rust
+pub struct StringContainsExpr {
+    expr: PhysicalExprRef,
+    infix: String,
+}
+```
+
+Detailed explanation: these files implement Spark string predicate expressions as DataFusion physical expressions. They allow converted Spark filters and projections to evaluate `contains`, `startsWith`, and `endsWith` semantics natively over Arrow string arrays.
+
+#### `datafusion-ext-functions/src/lib.rs`
+
+Main code snippet:
+```rust
+pub fn create_spark_ext_function(name: &str) -> Result<ScalarFunctionImplementation> {
+    Ok(match name {
+        "NullIf" => Arc::new(spark_null_if::spark_null_if),
+        "MakeDecimal" => Arc::new(spark_make_decimal::spark_make_decimal),
+        "GetJsonObject" => Arc::new(spark_get_json_object::spark_get_json_object),
+        "StringConcat" => Arc::new(spark_strings::string_concat),
+        "Year" => Arc::new(spark_dates::spark_year),
+        _ => df_unimplemented_err!("spark ext function not implemented: {name}")?,
+    })
+}
+```
+
+Detailed explanation: this crate is the registry for scalar functions that need Spark-compatible behavior. During Protobuf expression deserialization, Spark function names are resolved here into DataFusion scalar function implementations.
+
+#### `datafusion-ext-commons/src/lib.rs`
+
+Main code snippet:
+```rust
+#[macro_export]
+macro_rules! df_execution_err {
+    ($($arg:tt)*) => {
+        Err(datafusion::common::DataFusionError::Execution(format!($($arg)*)))
+    }
+}
+
+pub fn batch_size() -> usize {
+    const CACHED_BATCH_SIZE: OnceCell<usize> = OnceCell::new();
+    *CACHED_BATCH_SIZE.get_or_init(|| BATCH_SIZE.value().unwrap_or(10000) as usize)
+}
+```
+
+Detailed explanation: commons contains shared error macros, Arrow helpers, hashing utilities, batch sizing, serialization helpers, and Spark-compatible scalar structures. It is intentionally dependency-light so plans, expressions, functions, and serde code can share common behavior.
 
 ### Dependencies
 - **datafusion-ext-plans depends on**: DataFusion, datafusion-ext-exprs, datafusion-ext-functions, datafusion-ext-commons
@@ -809,21 +1665,17 @@ pub struct AggExec {
 
 *Approximate, for relative comparison
 
----
-
 ## Next Steps
 
-- **Trace execution paths**: See [CRITICAL-PATHS.md](CRITICAL-PATHS.md)
-- **Add new operators**: See [EXTENSION-GUIDE.md](EXTENSION-GUIDE.md)
-- **Key terms**: See [GLOSSARY.md](GLOSSARY.md)
-
+- **Trace execution paths**: See [Critical Execution Paths](#critical-execution-paths)
+- **Add new operators**: See [Extension Guide](#auron-extension-guide)
+- **Key terms**: See [Glossary](#auron-glossary)
 
 ---
-
 
 # Critical Execution Paths
 
-This document traces end-to-end code paths through the Auron system with specific file and line references.
+> End-to-end code traces showing how queries flow through the system.
 
 ## Path 1: Query Conversion (SparkPlan → NativeExec → Protobuf)
 
@@ -848,7 +1700,7 @@ class AuronSparkSessionExtension extends (SparkSessionExtensions => Unit) {
 ### Step 2: Columnar Rule Triggers
 
 ```
-File: spark-extension/src/main/scala/org/apache/spark/sql/auron/AuronColumnarOverrides.scala
+File: spark-extension/src/main/scala/org/apache/spark/sql/auron/AuronSparkSessionExtension.scala
 
 object AuronColumnarOverrides extends ColumnarRule {
   override def preColumnarTransitions(plan: SparkPlan): SparkPlan = {
@@ -1481,22 +2333,7 @@ impl MemManager {
 
 ### Memory Flow
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Memory Configuration                       │
-│                                                                    │
-│  Executor Memory = spark.executor.memory                          │
-│         │                                                          │
-│         ├──▶ JVM Heap                                             │
-│         │      └── OnHeapSpillManager (Spark task memory)         │
-│         │                                                          │
-│         └──▶ Native Memory (spark.auron.memory.fraction)          │
-│                └── MemManager (Rust memory pool)                  │
-│                      ├── Aggregation buffers                      │
-│                      ├── Sort buffers                             │
-│                      └── Join hash tables                         │
-└──────────────────────────────────────────────────────────────────┘
-```
+Executor memory is split between Spark-managed JVM memory and Auron-managed native memory. JVM-side spill support is exposed through `OnHeapSpillManager`. Native execution initializes `MemManager` from the configured memory fraction and uses it for large native consumers such as aggregation buffers, sort buffers, and join hash tables.
 
 ---
 
@@ -1516,13 +2353,11 @@ impl MemManager {
 | Arrow import | `AuronCallNativeWrapper.scala` | `importBatch()` |
 | Memory management | `memmgr/mod.rs` | `MemManager` |
 
-
 ---
-
 
 # Auron Extension Guide
 
-This guide covers how to extend Auron with new operators, expressions, data sources, and configuration options.
+> Step-by-step instructions for adding operators, expressions, and data sources.
 
 ## Quick Links
 
@@ -2264,15 +3099,11 @@ spark.conf.set("spark.auron.log.level", "debug")
 tracing::debug!("Executing MyOperatorExec with {} rows", batch.num_rows());
 ```
 
-
 ---
-
 
 # Auron Glossary
 
-This glossary defines key terms and concepts used throughout the Auron codebase.
-
----
+> Definitions of key terms, type mappings, and quick file references.
 
 ## A
 
@@ -2288,7 +3119,7 @@ A columnar memory format for flat and hierarchical data. Auron uses Arrow for ze
 Scala class that manages a single native execution task. Wraps the JNI calls to start execution, iterate batches, and cleanup. Receives Arrow data via FFI callbacks.
 
 ### AuronColumnarOverrides
-**File**: `spark-extension/.../AuronColumnarOverrides.scala`
+**File**: `spark-extension/.../AuronSparkSessionExtension.scala`
 
 Spark `ColumnarRule` that intercepts physical plans and triggers conversion to native operators. Entry point for plan transformation.
 
