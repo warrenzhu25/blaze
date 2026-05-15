@@ -31,18 +31,6 @@
 - [Critical Execution Paths](#critical-execution-paths)
 - [Extension Guide](#auron-extension-guide)
 
-## How to Read This Document
-
-| If you want to... | Start with... |
-|-------------------|---------------|
-| Understand what Auron does | [System Overview](#auron-system-overview) |
-| Learn how joins/agg/shuffle work | [How It Works](#how-it-works) |
-| Explore the codebase | [Module Deep Dives](#auron-module-deep-dives) |
-| Trace code execution | [Critical Execution Paths](#critical-execution-paths) |
-| Add a new operator | [Extension Guide](#auron-extension-guide) |
-
----
-
 # Auron System Overview
 
 ## What is Auron?
@@ -173,24 +161,14 @@ Spark-side objects, task context, and SQL metrics remain on the JVM side. Arrow 
 
 ## Configuration
 
-### Enabling Auron
+Auron is enabled by default. Key settings:
 
 ```scala
-spark.conf.set("spark.auron.enable", "true")  // Default: true
+spark.conf.set("spark.auron.enable", "true")           // Enable/disable Auron
+spark.conf.set("spark.auron.memory.fraction", "0.6")   // Native memory fraction
 ```
 
-### Key Configuration Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `spark.auron.enable` | true | Enable/disable Auron |
-| `spark.auron.memory.fraction` | 0.6 | Fraction of executor memory for native |
-| `spark.auron.enable.scan` | true | Enable native scans |
-| `spark.auron.enable.project` | true | Enable native projections |
-| `spark.auron.enable.filter` | true | Enable native filters |
-| `spark.auron.enable.sort` | true | Enable native sorts |
-| `spark.auron.enable.aggregate` | true | Enable native aggregations |
-| `spark.auron.enable.join` | true | Enable native joins |
+For full configuration options, see [Configuration Reference](#configuration-reference).
 
 ## Fallback Behavior
 
@@ -313,8 +291,6 @@ NativeBroadcastJoinBase.doExecuteNative()
 | FULL | All rows from both sides |
 | LEFT_SEMI | Left rows that have a match (no right columns) |
 | LEFT_ANTI | Left rows that have NO match |
-
----
 
 ---
 
@@ -921,8 +897,6 @@ abstract class NativeFilterBase(condition: Expression, override val child: Spark
 
 ---
 
----
-
 ## 2. Spark Extension Shims (spark-extension-shims-spark3)
 
 ### Purpose
@@ -994,8 +968,6 @@ case class NativeFilterExec(condition: Expression, override val child: SparkPlan
 ### Entry Points
 1. `Shims.get` loads `ShimsImpl` via reflection
 2. `ShimsImpl.createXxx()` factory methods create operators
-
----
 
 ---
 
@@ -1119,8 +1091,6 @@ fn main() -> Result<(), String> {
 
 ---
 
----
-
 ## 4. JNI Bridge Layer
 
 This spans two locations: Java/Scala side and Rust side. Together, they form the bridge that lets Spark call into native code and receive results back.
@@ -1222,28 +1192,6 @@ public abstract class OnHeapSpillManager {
 
 **How it works:** this class is the JVM spill contract used by native code when data must be staged through Spark-managed on-heap resources. The disabled implementation throws for spill operations; Spark integrations provide a real task-scoped manager when on-heap spilling is available.
 
-#### Core Abstractions
-
-```java
-// auron-core/.../jni/JniBridge.java:20
-public class JniBridge {
-    // Start native execution, returns runtime pointer
-    public static native long callNative(
-        long initNativeMemory,
-        String logLevel,
-        AuronCallNativeWrapper wrapper);
-
-    // Get next Arrow batch
-    public static native boolean nextBatch(long ptr);
-
-    // Release native resources
-    public static native void finalizeNative(long ptr);
-
-    // Cleanup on JVM exit
-    public static native void onExit();
-}
-```
-
 ### Rust Side (auron-jni-bridge)
 
 #### Purpose
@@ -1304,29 +1252,6 @@ pub fn is_task_running() -> bool {
 
 **How it works:** `lib.rs` exposes JNI bridge modules and task-state helpers to the rest of the native engine. Operators and runtime code call these helpers to ensure JNI has been initialized and to stop native work when Spark cancels or completes a task.
 
-#### Core Abstractions
-
-```rust
-// native-engine/auron-jni-bridge/src/jni_bridge.rs:30
-thread_local! {
-    // Thread-local JNI environment
-    pub static THREAD_JNIENV: RefCell<Option<*mut JNIEnv>> = RefCell::new(None);
-}
-
-// RAII wrapper for JNI local references
-pub struct LocalRef<'a> {
-    obj: JObject<'a>,
-    env: &'a JNIEnv<'a>,
-}
-
-// Cached Java class references
-pub struct JavaClasses {
-    pub auron_call_native_wrapper: GlobalRef,
-    pub runtime_exception: GlobalRef,
-    // ... other cached classes
-}
-```
-
 ### JNI Call Flow
 `JniBridge.callNative()` initializes the Rust-side JNI bridge on first use, configures logging and DataFusion session state, creates a `NativeExecutionRuntime`, and returns its raw pointer as a JVM `long`. `JniBridge.nextBatch(ptr)` asks that runtime for the next Arrow batch and calls back into `AuronCallNativeWrapper.importBatch()` to hand the FFI pointers to the JVM. `JniBridge.finalizeNative(ptr)` consumes the pointer and drops the runtime so Rust resources are released.
 
@@ -1334,8 +1259,6 @@ pub struct JavaClasses {
 - **Java depends on**: JNI libraries
 - **Rust depends on**: jni crate
 - **Depended by**: auron (main runtime)
-
----
 
 ---
 
@@ -1469,8 +1392,6 @@ pub fn init_logging(level: &str) {
 1. `Java_org_apache_spark_sql_auron_JniBridge_callNative` - Start execution
 2. `Java_org_apache_spark_sql_auron_JniBridge_nextBatch` - Get next batch
 3. `Java_org_apache_spark_sql_auron_JniBridge_finalizeNative` - Cleanup
-
----
 
 ---
 
@@ -2087,8 +2008,6 @@ object NativeConverters {
 
 ---
 
----
-
 ## Path 2: Execution (JNI → Rust Deserialization → DataFusion)
 
 This path traces how a serialized plan is executed in the native engine. Follow this when debugging native execution issues or understanding the JNI boundary.
@@ -2366,8 +2285,6 @@ impl NativeExecutionRuntime {
 
 ---
 
----
-
 ## Path 3: Data Return (Arrow RecordBatch → Spark InternalRow)
 
 This path shows how native results flow back to Spark. Follow this when debugging data corruption issues or understanding memory ownership.
@@ -2477,8 +2394,6 @@ class AuronColumnarBatchRow(batch: ColumnarBatch, rowId: Int)
   // ... other type accessors
 }
 ```
-
----
 
 ---
 
