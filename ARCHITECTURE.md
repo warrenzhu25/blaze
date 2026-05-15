@@ -58,7 +58,10 @@ Auron implements an ingenious, unified multi-tiered memory architecture ([auron-
 
 ### B. Dynamic Fair-Share Allocation
 Every memory-intensive operator (e.g., shuffle repartitioners, joins, aggregations) registers as a `MemConsumer`. As operators allocate memory, `MemManager` dynamically computes the available memory pool and updates each operator's maximum threshold in real time based on the number of active consumers:
-$$\text{consumer\_mem\_max} = \frac{\text{Total Memory} - \text{JVM Direct Memory} - \text{Unspillable Memory}}{\text{Active Spillable Consumers}}$$
+
+```
+consumer_mem_max = (Total Memory - JVM Direct Memory - Unspillable Memory) / Active Spillable Consumers
+```
 
 ### C. Dynamic Pressure Relief
 If a consumer exceeds its dynamic threshold, or if the total OS process RSS memory threatens the configured limit (`auron.process.vmrss.memoryFraction`, default 90%), `MemManager` dynamically intervenes:
@@ -105,10 +108,16 @@ Auron does not use Java's off-heap allocator because its vectorized engine runs 
 Because Auron executes in native Rust, it allocates memory directly from the operating system (via system malloc). The memory available to Rust is determined by the container's off-heap overhead.
 
 If you do not explicitly set `spark.executor.memoryOverhead`, Auron's [NativeHelper](file:///usr/local/google/home/warrenzhu/auron/spark-extension/src/main/scala/org/apache/spark/sql/auron/NativeHelper.scala#L51) automatically calculates it using Spark's default formula:
-$$\text{executorMemoryOverhead} = \max(0.10 \times \text{executorMemory}, 384\text{ MB})$$
+
+```
+executorMemoryOverhead = max(0.10 * executorMemory, 384 MB)
+```
 
 Auron then calculates the native memory pool passed to Rust as:
-$$\text{nativeMemory} = \text{totalMemory} - \text{Runtime.getRuntime().maxMemory()}$$
+
+```
+nativeMemory = totalMemory - Runtime.getRuntime().maxMemory()
+```
 
 Because `Runtime.getRuntime().maxMemory()` is essentially the JVM heap (`spark.executor.memory`), `nativeMemory` becomes exactly equal to `spark.executor.memoryOverhead`. Finally, Rust initializes [MemManager](file:///usr/local/google/home/warrenzhu/auron/native-engine/auron/src/exec.rs#L82) using a safe fraction of this overhead (`auron.memoryFraction`, default `0.6`).
 
