@@ -76,40 +76,13 @@ Spark's default execution model processes data row-by-row in the JVM. While this
 
 Auron is split across three execution layers:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           SPARK JVM LAYER                                   │
-│  ┌─────────────┐    ┌──────────────┐    ┌─────────────────────────────────┐ │
-│  │ Spark SQL   │───▶│   Catalyst   │───▶│ AuronSparkSessionExtension      │ │
-│  │   Query     │    │   Optimizer  │    │ (Installs columnar rule)        │ │
-│  └─────────────┘    └──────────────┘    └─────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼ Plan conversion
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      AURON SPARK EXTENSION LAYER                            │
-│  ┌─────────────────────┐         ┌───────────────────────────────────────┐  │
-│  │  AuronConverters    │────────▶│  NativeXxxExec operators              │  │
-│  │  (Plan conversion)  │         │  (Protobuf plan generation)           │  │
-│  └─────────────────────┘         └───────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼ JNI + Protobuf
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          RUST NATIVE LAYER                                  │
-│  ┌─────────────────────┐    ┌──────────────┐    ┌─────────────────────────┐ │
-│  │ NativeExecution     │───▶│  auron-serde │───▶│      DataFusion         │ │
-│  │ Runtime (JNI entry) │    │  (Protobuf   │    │   (Plan execution)      │ │
-│  │                     │    │   → Plans)   │    │                         │ │
-│  └─────────────────────┘    └──────────────┘    └─────────────────────────┘ │
-│                                                            │                │
-│                                                            ▼                │
-│                                                   Arrow RecordBatch         │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼ Arrow FFI
-                            Results back to Spark
-```
+**Spark JVM Layer:** Spark SQL Query → Catalyst Optimizer → AuronSparkSessionExtension (installs columnar rule)
+  ↓ (Plan conversion)
+**Auron Spark Extension Layer:** AuronConverters (plan conversion) → NativeXxxExec operators (Protobuf plan generation)
+  ↓ (JNI + Protobuf)
+**Rust Native Layer:** NativeExecutionRuntime (JNI entry) → auron-serde (Protobuf → Plans) → DataFusion (plan execution) → Arrow RecordBatch
+  ↓ (Arrow FFI)
+Results back to Spark
 
 1. **Spark JVM layer**: Spark receives SQL, Catalyst builds a physical plan, and `AuronSparkSessionExtension` installs a columnar rule that can replace supported Spark operators with native Auron operators.
 
@@ -317,14 +290,7 @@ Used when one side is small enough to broadcast (typically < 10MB, configurable 
    - SIMD compare against 8 candidates per cache line
    - Output joined rows
 
-**Hash Map Structure:**
-```
-MapValueGroup (64 bytes, cache-line aligned):
-┌────────────────────────────────────────────────────┐
-│ hash[0..7]  (8 × 4-byte hashes for SIMD compare)   │
-│ value_or_idx[0..7] (row indices or chain pointers) │
-└────────────────────────────────────────────────────┘
-```
+**Hash Map Structure:** Each `MapValueGroup` is 64 bytes (cache-line aligned) containing: `hash[0..7]` (8 × 4-byte hashes for SIMD compare) + `value_or_idx[0..7]` (row indices or chain pointers).
 - Single values stored inline; collisions chain via `mapped_indices`
 - Cached hash maps reusable across stages (`cachedBuildHashMapId`)
 
@@ -568,32 +534,12 @@ trait MemConsumer {
 
 When an operator reports memory growth, the `MemManager` decides whether to allow it or trigger spilling:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ Operator requests memory growth                                 │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────────┐
-              │ total_used + request > budget? │
-              └───────────────────────────────┘
-                     │                │
-                    YES              NO
-                     │                │
-                     ▼                ▼
-         ┌─────────────────┐    ┌──────────────┐
-         │ size > 16MB AND │    │ Allow growth │
-         │ growing?        │    └──────────────┘
-         └─────────────────┘
-              │         │
-             YES       NO
-              │         │
-              ▼         ▼
-    ┌─────────────┐  ┌────────────────────┐
-    │ SPILL now   │  │ WAIT up to 10 sec  │
-    │ (if > min)  │  │ then force spill   │
-    └─────────────┘  └────────────────────┘
-```
+1. **Operator requests memory growth**
+2. **Check:** Is `total_used + request > budget`?
+   - **NO** → Allow growth
+   - **YES** → Check: Is `size > 16MB AND growing`?
+     - **YES** → SPILL now (if size > consumer_min)
+     - **NO** → WAIT up to 10 seconds, then force spill
 
 **Concrete Example:**
 - Budget: 1.2GB total
@@ -673,60 +619,18 @@ When native execution encounters errors, Auron ensures clean error propagation b
 
 ## Module Dependency Graph
 
-```
-                              JVM SIDE
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                                                             │
-│   ┌─────────────────────┐         ┌──────────────────────────────────────┐  │
-│   │   spark-extension   │◀────────│  spark-extension-shims-spark3        │  │
-│   │   (base classes,    │         │  (Spark 3.x concrete operators)      │  │
-│   │    converters)      │         └──────────────────────────────────────┘  │
-│   └─────────────────────┘                                                   │
-│            │                                                                │
-│            ▼                                                                │
-│   ┌─────────────────────┐                                                   │
-│   │     auron-core      │  (JNI bridge, configuration, memory mgmt)         │
-│   └─────────────────────┘                                                   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-                              │
-                              │ JNI + Protobuf
-                              ▼
-                             RUST SIDE
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                                                             │
-│   ┌─────────────────────┐                                                   │
-│   │       auron         │  (JNI entry points, runtime lifecycle)            │
-│   └─────────────────────┘                                                   │
-│        │           │                                                        │
-│        ▼           ▼                                                        │
-│   ┌──────────┐  ┌─────────────────┐                                         │
-│   │ auron-   │  │ auron-jni-      │                                         │
-│   │ serde    │  │ bridge          │                                         │
-│   │(protobuf)│  │ (JNI utilities) │                                         │
-│   └──────────┘  └─────────────────┘                                         │
-│        │                                                                    │
-│        ▼                                                                    │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                    datafusion-ext-plans                             │   │
-│   │                    (physical operators)                             │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│        │                                                                    │
-│        ├──────────────────┬─────────────────────┐                           │
-│        ▼                  ▼                     ▼                           │
-│   ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐                │
-│   │ datafusion-  │  │ datafusion-  │  │ datafusion-ext-    │                │
-│   │ ext-exprs    │  │ ext-functions│  │ commons            │                │
-│   │ (expressions)│  │ (SQL funcs)  │  │ (shared utilities) │                │
-│   └──────────────┘  └──────────────┘  └────────────────────┘                │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**JVM Side:**
+- **spark-extension-shims-spark3** (Spark 3.x concrete operators) → depends on → **spark-extension** (base classes, converters)
+- **spark-extension** → depends on → **auron-core** (JNI bridge, configuration, memory mgmt)
 
-**Reading the Diagram:**
-- Arrows point from dependent → dependency (A → B means A depends on B)
-- JVM modules compile to JARs; Rust modules compile to a single native library
-- The JNI boundary is the only runtime connection between the two sides
+**JNI + Protobuf boundary**
+
+**Rust Side:**
+- **auron** (JNI entry points, runtime lifecycle) → depends on → **auron-serde** (protobuf) + **auron-jni-bridge** (JNI utilities)
+- **auron-serde** → depends on → **datafusion-ext-plans** (physical operators)
+- **datafusion-ext-plans** → depends on → **datafusion-ext-exprs** (expressions) + **datafusion-ext-functions** (SQL funcs) + **datafusion-ext-commons** (shared utilities)
+
+**Notes:** JVM modules compile to JARs; Rust modules compile to a single native library. The JNI boundary is the only runtime connection between the two sides.
 
 ---
 
