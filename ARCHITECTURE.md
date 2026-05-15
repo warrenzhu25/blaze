@@ -10,25 +10,6 @@ To achieve maximum performance, scalability, and stability under heavy distribut
 
 Auron intercepts Spark’s shuffle mechanism by overriding `spark.shuffle.manager` with [AuronShuffleManager](file:///usr/local/google/home/warrenzhu/auron/spark-extension-shims-spark/src/main/scala/org/apache/spark/sql/execution/auron/shuffle/AuronShuffleManager.scala).
 
-```mermaid
-graph TD
-    subgraph JVM Runtime
-        A[Spark Map Task] -->|getWriter| B(AuronShuffleWriter)
-        B -->|Construct Protobuf Plan| C[NativeHelper.executeNativePlan]
-    end
-    subgraph Native Rust Runtime (DataFusion)
-        C -->|JNI Call| D[ShuffleWriterExec]
-        D -->|Stage Batches| E[BufferedData]
-        E -->|Radix Sort by Part ID| F[SortShuffleRepartitioner]
-        F -->|Memory > 80% Threshold| G[Proactive Spilling]
-        G -->|Flush Chunk| H[(Spill Files: On-Heap / Disk)]
-        F -->|Task Completion| I[OffsettedMergeIterator]
-        H --> I
-        I -->|Sequential Merge| J[(Final .data & .index Files)]
-    end
-    J -->|Commit| K[Spark IndexShuffleBlockResolver]
-```
-
 ### A. Delegation to the Native Engine
 When a map task begins, Spark calls `getWriter()`, which returns an [AuronShuffleWriter](file:///usr/local/google/home/warrenzhu/auron/spark-extension-shims-spark/src/main/scala/org/apache/spark/sql/execution/auron/shuffle/AuronShuffleWriter.scala). Instead of executing row-by-row evaluation inside the JVM, `AuronShuffleWriterBase` constructs a `ShuffleWriterExecNode` protobuf containing temporary `.data.tmp` and `.index.tmp` file paths, and delegates execution to the native Rust engine via `NativeHelper.executeNativePlan`.
 
@@ -48,26 +29,6 @@ In the native Rust engine, [ShuffleWriterExec](file:///usr/local/google/home/war
 ## 2. Shuffle Read Architecture
 
 On the reduce side, `AuronShuffleManager` overrides `getReader()` and returns an [AuronBlockStoreShuffleReader](file:///usr/local/google/home/warrenzhu/auron/spark-extension-shims-spark/src/main/scala/org/apache/spark/sql/execution/auron/shuffle/AuronBlockStoreShuffleReader.scala).
-
-```mermaid
-graph TD
-    subgraph JVM Runtime
-        A[Spark Reduce Task] -->|getReader| B(AuronBlockStoreShuffleReader)
-        B -->|ShuffleBlockFetcherIterator| C[readIpc BlockObject Iterator]
-        C -->|Register UUID| D[JniBridge.putResource]
-    end
-    subgraph Native Rust Runtime (DataFusion)
-        D -->|Pass Resource ID| E[IpcReaderExec]
-        E -->|Tokio Blocking Task| F[Fetch BlockObject via JNI]
-        F -->|hasFileSegment| G[File Reader]
-        F -->|hasByteBuffer| H[Direct/Heap ByteBuffer Reader]
-        F -->|getChannel| I[ReadableByteChannel Reader]
-        G --> J[IpcCompressionReader]
-        H --> J
-        I --> J
-        J -->|Decode & Coalesce| K[Vectorized RecordBatch Stream]
-    end
-```
 
 ### A. IPC Block Abstraction & JNI Registry
 Rather than deserializing individual Java objects, Auron fetches raw block streams and encapsulates them using `readIpc()`.
@@ -89,22 +50,6 @@ The physical plan sent to Rust contains an [IpcReaderExec](file:///usr/local/goo
 ## 3. Dynamic Multi-Tiered Memory Management
 
 Auron implements an ingenious, unified multi-tiered memory architecture ([auron-memmgr](file:///usr/local/google/home/warrenzhu/auron/native-engine/auron-memmgr/src/lib.rs)) that bridges the JVM and Rust runtimes across three distinct tiers: **Native Off-Heap Memory $\rightarrow$ JVM On-Heap Memory $\rightarrow$ Disk**.
-
-```mermaid
-graph TD
-    subgraph Tier 1: Native Off-Heap Memory
-        A[Rust MemManager] -->|Tracks RSS via procfs| B(Fair-Share Allocation)
-        B -->|Memory Pressured| C{Check JVM On-Heap Capacity}
-    end
-    subgraph Tier 2: JVM On-Heap Memory
-        C -->|Yes: Free > 10%| D[OnHeapSpill / ByteBuffer]
-        C -->|No: JVM Full| E[FileSpill / Local Disk]
-    end
-    subgraph Tier 3: Local Disk Storage
-        D -->|Spark TaskMemoryManager Pressured| F[Spark BlockManager Flush]
-        F --> E
-    end
-```
 
 ### A. Real-Time Cross-Runtime Monitoring (`MemManager`)
 `MemManager` does not just track internal Rust allocations. It continuously queries:
