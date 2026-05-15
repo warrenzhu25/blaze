@@ -12,6 +12,7 @@
 - [Spark Integration](#spark-integration)
 - [Two-Tier Spilling](#two-tier-spilling)
 - [Spill Flow](#spill-flow)
+- [Spill Examples](#spill-examples)
 - [Key Components](#key-components)
 - [Configuration](#configuration)
 - [Metrics](#metrics)
@@ -361,6 +362,467 @@ Each operator type handles spilling differently:
 - Tracks staged + sorted buffers
 - Spill: Write sorted partition data
 - Output: Merge all spills by partition ID
+
+---
+
+## Spill Examples
+
+Concrete examples showing how memory spilling works in different scenarios.
+
+### Example 1: Aggregation Spill
+
+**Scenario:** Hash aggregation exceeds memory budget
+
+```
+Input: 100M rows, GROUP BY user_id (10M unique users)
+Native budget: 512MB
+Hash table size: 800MB (exceeds budget!)
+```
+
+**Flow:**
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│  1. Process input batches, hash table grows                            │
+│                                                                        │
+│     AggTable.process_input_batch()                                     │
+│       → HashingData.update_batch()                                     │
+│       → self.update_mem_used(mem_used).await  ← Reports 600MB          │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  2. MemManager detects overflow                                        │
+│                                                                        │
+│     total_used (600MB) > consumer_mem_max (512MB/2 = 256MB)           │
+│     AND mem_used > MIN_TRIGGER_SIZE (16MB)                             │
+│     AND growing = true                                                 │
+│     → Operation::Spill                                                 │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  3. AggTable.spill() called                                            │
+│                                                                        │
+│     // Freeze current hash table                                       │
+│     let cur_in_mem = in_mem.renew(next_is_hashing)?;                  │
+│                                                                        │
+│     // Write to spill (JVM heap or disk)                              │
+│     let spill = try_new_spill(&spill_metrics)?;                       │
+│     cur_in_mem.try_into_spill(&mut spill, spill_idx)?;                │
+│                                                                        │
+│     // Reset memory counter                                            │
+│     self.update_mem_used(0).await?;                                   │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  4. Continue processing with fresh hash table                          │
+│                                                                        │
+│     // New empty hash table                                            │
+│     in_mem = InMemTable::try_new(id+1, ...)?;                         │
+│                                                                        │
+│     // Spill stored for later merge                                   │
+│     spills.push(cur_spill);                                           │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  5. Output: Merge all spills + in-memory table                         │
+│                                                                        │
+│     // Radix merge by hash bucket                                      │
+│     for bucket in 0..256 {                                             │
+│         let cursor = SpillCursor::new(spill, bucket);                 │
+│         while cursor.has_next() {                                      │
+│             merge_record(&mut acc_table, cursor.next());              │
+│         }                                                              │
+│     }                                                                  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Code:** `agg_table.rs:322-352`
+
+```rust
+async fn spill(&self) -> Result<()> {
+    let mut in_mem = self.in_mem.lock().await;
+    let mut spills = self.spills.lock().await;
+
+    // Decide if next table should use hashing based on cardinality
+    let mut next_is_hashing = false;
+    if let InMemData::Hashing(hashing_data) = &in_mem.data {
+        if hashing_data.cardinality_ratio() < 0.5 {
+            next_is_hashing = true;  // Low cardinality, keep hashing
+        }
+    }
+
+    // Swap in a fresh table
+    let cur_in_mem = in_mem.renew(next_is_hashing)?;
+
+    // Write old table to spill file
+    let spill_metrics = self.exec_ctx.spill_metrics().clone();
+    let cur_spill = tokio::task::spawn_blocking(move || {
+        let mut spill = try_new_spill(&spill_metrics)?;  // JVM heap or disk
+        cur_in_mem.try_into_spill(&mut spill, spill_idx)?;
+        Ok(spill)
+    }).await??;
+
+    spills.push(cur_spill);
+    self.update_mem_used(0).await?;  // Memory released
+    Ok(())
+}
+```
+
+### Example 2: Sort Spill
+
+**Scenario:** Sorting large dataset with limited memory
+
+```
+Input: 50M rows to sort
+Native budget: 256MB
+Sorted blocks: 400MB total (exceeds budget!)
+```
+
+**Flow:**
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│  1. Insert batches, create sorted in-memory blocks                     │
+│                                                                        │
+│     sorter.insert_batch(batch).await                                  │
+│       → Sort batch by key                                              │
+│       → in_mem_blocks.push(InMemSortedBlock { sorted_keys, batch })   │
+│       → update_mem_used(total_mem_used)                               │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  2. Memory pressure triggers spill                                     │
+│                                                                        │
+│     ExternalSorter.spill() called                                     │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  3. Merge in-memory blocks → write to spill                           │
+│                                                                        │
+│     // Take all in-memory blocks                                       │
+│     let blocks = std::mem::take(&mut *self.in_mem_blocks.lock());     │
+│                                                                        │
+│     // Merge using loser tree (k-way merge)                           │
+│     let merged_block = merge_blocks(blocks, SpillSortedBlockBuilder); │
+│                                                                        │
+│     // Write to compressed spill file                                 │
+│     spills.push(LevelSpill { block: merged_block, level: 0 });        │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  4. Hierarchical merging (if too many spills)                         │
+│                                                                        │
+│     Level 0: [spill1, spill2, ..., spill32]  → merge → Level 1        │
+│     Level 1: [merged1, merged2, ...]         → merge → Level 2        │
+│                                                                        │
+│     // Keeps at most NUM_MAX_MERGING_BATCHES (32) per level           │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  5. Output: K-way merge of all spills + remaining in-memory           │
+│                                                                        │
+│     LoserTree merge:                                                   │
+│       - Compare min key from each source                              │
+│       - Output smallest, advance that source                          │
+│       - Repeat until all sources exhausted                            │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Code:** `sort_exec.rs:379-436`
+
+```rust
+async fn spill(&self) -> Result<()> {
+    let spills = self.spills.clone();
+    let blocks = std::mem::take(&mut *self.in_mem_blocks.lock());
+
+    tokio::task::spawn_blocking(move || {
+        let mut spills = spills.lock();
+
+        // Create spill file (JVM heap or disk)
+        let spill = try_new_spill(self.exec_ctx.spill_metrics())?;
+
+        // Merge all in-memory blocks into single sorted spill
+        let merged_block = merge_blocks::<_, SqueezeKeyCollector>(
+            self.clone(),
+            blocks,
+            SpillSortedBlockBuilder::new(self.pruned_schema(), spill),
+        )?;
+
+        spills.push(LevelSpill { block: merged_block, level: 0 });
+
+        // Hierarchical merge if too many spills at same level
+        for level in 0..levels.len() {
+            if levels[level].len() >= NUM_MAX_MERGING_BATCHES {  // 32
+                let spill = try_new_spill(self.exec_ctx.spill_metrics())?;
+                let merged = merge_blocks(
+                    std::mem::take(&mut levels[level]),
+                    SpillSortedBlockBuilder::new(schema, spill),
+                )?;
+                levels[level + 1].push(merged);  // Promote to next level
+            }
+        }
+        Ok(())
+    }).await??;
+
+    self.update_mem_used(0).await?;
+    Ok(())
+}
+```
+
+### Example 3: Shuffle Spill
+
+**Scenario:** Shuffle write with memory pressure
+
+```
+Input: 200 partitions output, 10GB data
+Native budget: 1GB
+Buffered data: 1.5GB (exceeds budget!)
+```
+
+**Flow:**
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│  1. Insert batches, buffer by partition                                │
+│                                                                        │
+│     SortShuffleRepartitioner.insert_batch(batch)                      │
+│       → Evaluate partition ID for each row                            │
+│       → Add to BufferedData (sorted by partition)                     │
+│       → update_mem_used(mem_used)                                     │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  2. Proactive spill at 80% memory usage                               │
+│                                                                        │
+│     if mem_used_percent > 0.8 {                                       │
+│         log::info!("memory usage: {}, spilling...", mem_used);        │
+│         self.force_spill().await?;                                    │
+│     }                                                                  │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  3. SortShuffleRepartitioner.spill()                                  │
+│                                                                        │
+│     // Drain current buffered data                                    │
+│     let data = self.data.lock().await.drain();                        │
+│                                                                        │
+│     // Write to spill with partition offsets                          │
+│     let spill = try_new_spill(&spill_metrics)?;                       │
+│     let offsets = data.write(spill.get_buf_writer())?;                │
+│                                                                        │
+│     // Store spill with offset index                                  │
+│     spills.push(Offsetted::new(offsets, spill));                      │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  4. Final shuffle_write: merge all spills by partition                │
+│                                                                        │
+│     // Merge iterator reads partition-by-partition from all spills    │
+│     let merge_iter = OffsettedMergeIterator::new(                     │
+│         num_output_partitions,                                         │
+│         spills.into_iter().map(...)                                   │
+│     );                                                                 │
+│                                                                        │
+│     // Write each partition's data contiguously                       │
+│     while let Some((partition_id, reader, range)) = merge_iter.next() │
+│         std::io::copy(&mut reader, &mut output_data)?;                │
+│     }                                                                  │
+│                                                                        │
+│     // Write index file with partition offsets                        │
+│     output_index.write_all(&offsets_data)?;                           │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Code:** `sort_repartitioner.rs:98-112`
+
+```rust
+async fn spill(&self) -> Result<()> {
+    // Drain buffered data
+    let data = self.data.lock().await.drain();
+    let spill_metrics = self.exec_ctx.spill_metrics().clone();
+
+    // Write to spill in background thread
+    let spill = tokio::task::spawn_blocking(move || {
+        let mut spill = try_new_spill(&spill_metrics)?;  // JVM heap or disk
+        let offsets = data.write(spill.get_buf_writer())?;  // Compressed
+        Ok(Offsetted::new(offsets, spill))  // Keep partition offsets
+    }).await??;
+
+    self.spills.lock().await.push(spill);
+    self.update_mem_used(0).await?;
+    Ok(())
+}
+```
+
+### Example 4: JVM On-Heap → Disk Cascade
+
+**Scenario:** JVM heap fills up during native spill
+
+```
+Native spill triggered → tries JVM on-heap
+JVM on-heap at 95% → cascades to disk
+```
+
+**Flow:**
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│  1. Native operator needs to spill                                     │
+│                                                                        │
+│     // Rust code                                                       │
+│     let spill = try_new_spill(&spill_metrics)?;                       │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  2. Check JVM heap availability via JNI                               │
+│                                                                        │
+│     // Rust calls Java                                                 │
+│     let hsm = jni_call_static!(JniBridge.getTaskOnHeapSpillManager())?;│
+│     if jni_call!(AuronOnHeapSpillManager(hsm).isOnHeapAvailable())? { │
+│         // Use JVM heap                                                │
+│     }                                                                  │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  3. OnHeapSpillManager.isOnHeapAvailable() (Scala)                    │
+│                                                                        │
+│     val memoryPool = OnHeapSpillManagerHelper.getOnHeapExecutionPool  │
+│     val memoryUsedRatio = memoryUsed / (memoryUsed + memoryFree)      │
+│     val jvmMemoryUsedRatio = jvmUsed / (jvmUsed + jvmFree)            │
+│                                                                        │
+│     // Need < 90% usage on both                                        │
+│     return memoryUsedRatio < 0.9 && jvmMemoryUsedRatio < 0.9          │
+│                                                                        │
+│     // Returns FALSE (95% used) → fall back to disk                   │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  4. Create FileSpill instead                                          │
+│                                                                        │
+│     // Rust code in spill.rs                                          │
+│     pub fn try_new_spill(...) -> Result<Box<dyn Spill>> {             │
+│         if hsm.isOnHeapAvailable() {                                  │
+│             Ok(Box::new(OnHeapSpill::try_new(hsm)?))  // NOT taken    │
+│         } else {                                                       │
+│             Ok(Box::new(FileSpill::try_new()?))       // ← TAKEN      │
+│         }                                                              │
+│     }                                                                  │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  5. FileSpill writes compressed data to temp file                     │
+│                                                                        │
+│     let file_name = JniBridge.getDirectWriteSpillToDiskFile();        │
+│     let file = OpenOptions::new().create(true).write(true).open()?;   │
+│                                                                        │
+│     // LZ4 compressed writes                                          │
+│     IoCompressionWriter::try_new("lz4", BufWriter::new(file))         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Example 5: On-Heap Spill with Spark Memory Pressure
+
+**Scenario:** Spark needs memory while Auron is spilling to heap
+
+```
+Auron spilling to JVM heap (MemBasedSpillBuf)
+Spark operator requests memory
+Spark calls OnHeapSpillManager.spill()
+```
+
+**Flow:**
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│  1. Auron data in JVM heap via OnHeapSpill                            │
+│                                                                        │
+│     OnHeapSpill                                                        │
+│       └── MemBasedSpillBuf (Netty ByteBuf, 500MB in heap)             │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  2. Another Spark operator needs memory                               │
+│                                                                        │
+│     TaskMemoryManager.acquireExecutionMemory(200MB)                   │
+│       → Not enough free memory                                         │
+│       → Calls spill() on registered MemoryConsumers                   │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  3. OnHeapSpillManager.spill() called by Spark                        │
+│                                                                        │
+│     override def spill(size: Long, trigger: MemoryConsumer): Long = { │
+│       // Don't spill if we're < 50% of task memory                    │
+│       if (trigger != this &&                                           │
+│           memUsed * 2 < taskMemoryManager.getMemoryConsumption) {     │
+│         return 0L                                                      │
+│       }                                                                │
+│                                                                        │
+│       // Sort by size descending, spill largest first                 │
+│       val sortedSpills = spills.sortBy(-_.memUsed)                    │
+│       sortedSpills.foreach { spill =>                                 │
+│         totalFreed += spill.spill()  // MemBased → FileBased          │
+│         if (totalFreed >= size) return totalFreed                     │
+│       }                                                                │
+│     }                                                                  │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  4. MemBasedSpillBuf.spill() → FileBasedSpillBuf                      │
+│                                                                        │
+│     def spill(): FileBasedSpillBuf = {                                │
+│       val file = blockManager.diskBlockManager.createTempLocalBlock() │
+│       val channel = new RandomAccessFile(file, "rw").getChannel       │
+│                                                                        │
+│       // Write all Netty buffers to disk                              │
+│       while (!bufs.isEmpty) {                                          │
+│         channel.write(bufs.removeFirst().nioBuffer())                 │
+│       }                                                                │
+│                                                                        │
+│       new FileBasedSpillBuf(numWrittenBytes, file, channel)           │
+│     }                                                                  │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  5. Memory freed, Spark operator proceeds                             │
+│                                                                        │
+│     // OnHeapSpillManager returns freed memory to Spark               │
+│     hsm.freeMemory(releasingMemory)                                   │
+│                                                                        │
+│     // Auron reads continue from disk-backed spill                    │
+│     // (transparent to native code)                                   │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Spill Trigger Summary
+
+| Trigger | Condition | Action |
+|---------|-----------|--------|
+| Native budget exceeded | `total_used > total_managed` | Spill largest consumer |
+| Per-consumer limit | `consumer_used > consumer_max` | Spill this consumer |
+| Process RSS (Linux) | `proc_rss > proc_max` | Spill largest consumer |
+| Shuffle proactive | `mem_used_percent > 0.8` | Force spill shuffle buffer |
+| JVM heap full | `heap_ratio > 0.9` | Use disk instead of heap |
+| Spark memory pressure | `MemoryConsumer.spill()` callback | Spill heap to disk |
 
 ---
 
