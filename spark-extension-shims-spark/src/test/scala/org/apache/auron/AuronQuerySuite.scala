@@ -19,6 +19,7 @@ package org.apache.auron
 import org.apache.spark.sql.{AuronQueryTest, Row}
 import org.apache.spark.sql.auron.NativeRDD
 import org.apache.spark.sql.auron.join.JoinBuildSides.{JoinBuildLeft, JoinBuildRight}
+import org.apache.spark.sql.execution.auron.plan.NativeExpandBase
 import org.apache.spark.sql.execution.auron.plan.NativeFilterBase
 import org.apache.spark.sql.execution.auron.plan.NativeOrcScanBase
 import org.apache.spark.sql.execution.auron.plan.NativeParquetScanBase
@@ -1233,6 +1234,68 @@ class AuronQuerySuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQ
           |SUM(amount) FILTER (WHERE NOT flag), COUNT(*) FILTER (WHERE NOT flag)
           |FROM t_filter_agg_null GROUP BY category""".stripMargin),
         Seq(Row("a", 1L, 1L), Row("b", null, 0L)))
+    }
+  }
+
+  test("multiple count distinct") {
+    // Spark's RewriteDistinctAggregates rewrites multiple distinct aggregates into an Expand
+    // plus aggregates filtered on the expand group id (gid), which must all run natively.
+    def checkNativeDistinctRewrite(query: String): Unit = {
+      val df = checkSparkAnswerAndOperator(query)
+      // guard that the query still exercises the Expand-based rewrite
+      assert(
+        find(df.queryExecution.executedPlan)(_.isInstanceOf[NativeExpandBase]).isDefined,
+        s"expected NativeExpand in plan:\n${df.queryExecution.executedPlan}")
+    }
+
+    withTable("t_multi_count_distinct_1524") {
+      sql("""CREATE TABLE t_multi_count_distinct_1524(
+        |  region STRING, product STRING, year INT, amount BIGINT
+        |) USING parquet""".stripMargin)
+      sql("""INSERT INTO t_multi_count_distinct_1524 VALUES
+        |('r1', 'pA', 2023, 100), ('r1', 'pB', 2023, 200), ('r1', 'pA', 2024, 300),
+        |('r2', 'pB', 2023, 400), ('r2', NULL, 2023, 500), ('r2', 'pC', NULL, NULL),
+        |(NULL, 'pA', 2024, 600)
+        |""".stripMargin)
+
+      // multiple distinct aggregates with GROUP BY
+      checkNativeDistinctRewrite("""SELECT region,
+        |  COUNT(DISTINCT product) AS distinct_products,
+        |  COUNT(DISTINCT year)    AS distinct_years
+        |FROM t_multi_count_distinct_1524
+        |GROUP BY region""".stripMargin)
+
+      // distinct aggregates over a grouping column, as in the original report
+      checkNativeDistinctRewrite("""SELECT region, year,
+        |  COUNT(DISTINCT product) AS distinct_products,
+        |  COUNT(DISTINCT region)  AS distinct_regions
+        |FROM t_multi_count_distinct_1524
+        |GROUP BY region, year""".stripMargin)
+
+      // distinct aggregates mixed with regular aggregates
+      checkNativeDistinctRewrite("""SELECT region,
+        |  COUNT(DISTINCT product), COUNT(DISTINCT year), SUM(amount), COUNT(*)
+        |FROM t_multi_count_distinct_1524
+        |GROUP BY region""".stripMargin)
+
+      // without GROUP BY
+      checkNativeDistinctRewrite("""SELECT
+        |  COUNT(DISTINCT product), COUNT(DISTINCT region), COUNT(DISTINCT year)
+        |FROM t_multi_count_distinct_1524""".stripMargin)
+
+      // distinct aggregate with a FILTER clause: the native filter becomes
+      // (gid = N AND <user predicate>)
+      checkNativeDistinctRewrite("""SELECT region,
+        |  COUNT(DISTINCT product) FILTER (WHERE year = 2023) AS products_2023,
+        |  COUNT(DISTINCT year) AS distinct_years
+        |FROM t_multi_count_distinct_1524
+        |GROUP BY region""".stripMargin)
+
+      // multi-column and non-count distinct aggregates
+      checkNativeDistinctRewrite("""SELECT region,
+        |  COUNT(DISTINCT product, year), SUM(DISTINCT amount), AVG(DISTINCT year)
+        |FROM t_multi_count_distinct_1524
+        |GROUP BY region""".stripMargin)
     }
   }
 
