@@ -21,7 +21,6 @@ use bytesize::ByteSize;
 use count_write::CountWrite;
 use datafusion::{common::Result, physical_plan::metrics::Time};
 use datafusion_ext_commons::{
-    algorithm::rdx_sort::radix_sort_by_key,
     arrow::{
         array_size::BatchSize,
         selection::{BatchInterleaver, create_batch_interleaver},
@@ -29,16 +28,12 @@ use datafusion_ext_commons::{
     compute_suggested_batch_size_for_output, df_execution_err,
     io::ipc_compression::IpcCompressionWriter,
 };
-use itertools::Itertools;
 use jni::objects::GlobalRef;
 #[cfg(test)]
 use parking_lot::Mutex;
 
 use crate::{
-    common::{
-        offsetted::{Offsetted, OffsettedMergeIterator},
-        timer_helper::TimerHelper,
-    },
+    common::timer_helper::TimerHelper,
     shuffle::{
         Partitioning, evaluate_hashes, evaluate_partition_ids, evaluate_range_partition_ids,
         evaluate_robin_partition_ids, rss::RssWriter,
@@ -222,11 +217,18 @@ impl BufferedData {
     }
 }
 
+/// Iterates buffered rows partition by partition. Within a partition, rows are
+/// emitted in input order: sorted batches in the order they were flushed, and
+/// rows within each batch in the order they were added. All sorted batches are
+/// in memory, so each partition's slices are taken directly from the per-batch
+/// offsets.
 struct PartitionedBatchesIterator<'a> {
     batch_interleaver: BatchInterleaver,
-    merge_iter: OffsettedMergeIterator<'a, u32, usize>,
+    batch_offsets: Vec<Vec<u32>>,
+    num_partitions: usize,
+    next_partition_id: usize,
     batch_size: usize,
-    last_chunk_partition_id: Option<usize>,
+    _phantom: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> PartitionedBatchesIterator<'a> {
@@ -238,21 +240,16 @@ impl<'a> PartitionedBatchesIterator<'a> {
     ) -> Result<Self> {
         Ok(Self {
             batch_interleaver: create_batch_interleaver(&batches, true)?,
-            merge_iter: OffsettedMergeIterator::new(
-                num_partitions,
-                batch_offsets
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, offsets)| Offsetted::new(offsets, idx))
-                    .collect(),
-            ),
+            batch_offsets,
+            num_partitions,
+            next_partition_id: 0,
             batch_size: sub_batch_size,
-            last_chunk_partition_id: None,
+            _phantom: Default::default(),
         })
     }
 
-    /// all iterators returned should have been fully consumed
-    #[allow(clippy::panic)] // Temporarily allow panic to refactor to Result later
+    /// Returns the next non-empty partition and an iterator over its rows, in
+    /// input order, as batches of at most `batch_size` rows.
     pub fn next_partition_chunk(
         &mut self,
     ) -> Option<(usize, impl Iterator<Item = RecordBatch> + 'a)> {
@@ -260,31 +257,38 @@ impl<'a> PartitionedBatchesIterator<'a> {
         let batches_iter =
             unsafe { std::mem::transmute::<_, &mut PartitionedBatchesIterator<'a>>(self) };
 
-        let (chunk_partition_id, chunk) = batches_iter.merge_iter.next_partition_chunk()?;
+        while batches_iter.next_partition_id < batches_iter.num_partitions {
+            let partition_id = batches_iter.next_partition_id;
+            batches_iter.next_partition_id += 1;
 
-        // last chunk must be fully consumed
-        if batches_iter.last_chunk_partition_id == Some(chunk_partition_id) {
-            panic!("last chunk not fully consumed");
-        }
-        batches_iter.last_chunk_partition_id = Some(chunk_partition_id);
-
-        let batch_iter = chunk.batching(|chunk| {
-            let mut indices = vec![];
-            for (batch_idx, range) in chunk {
-                indices.extend(range.map(|offset| (*batch_idx, offset as usize)));
-                if indices.len() >= batches_iter.batch_size {
-                    break;
-                }
+            let ranges = batches_iter
+                .batch_offsets
+                .iter()
+                .enumerate()
+                .filter_map(|(batch_idx, offsets)| {
+                    let range = offsets[partition_id] as usize..offsets[partition_id + 1] as usize;
+                    (!range.is_empty()).then_some((batch_idx, range))
+                })
+                .collect::<Vec<_>>();
+            if ranges.is_empty() {
+                continue;
             }
 
-            if indices.is_empty() {
-                return None;
-            }
+            let batch_size = batches_iter.batch_size;
+            let mut rows = ranges
+                .into_iter()
+                .flat_map(|(batch_idx, range)| range.map(move |row_idx| (batch_idx, row_idx)));
             let batch_interleaver = &mut batches_iter.batch_interleaver;
-            let output_batch = batch_interleaver(&indices).expect("error interleaving batches");
-            return Some(output_batch);
-        });
-        Some((chunk_partition_id, batch_iter))
+            let batch_iter = std::iter::from_fn(move || {
+                let indices = rows.by_ref().take(batch_size).collect::<Vec<_>>();
+                if indices.is_empty() {
+                    return None;
+                }
+                Some(batch_interleaver(&indices).expect("error interleaving batches"))
+            });
+            return Some((partition_id, batch_iter));
+        }
+        None
     }
 }
 
@@ -299,7 +303,7 @@ fn sort_batches_by_partition_id(
         (partition_id * 1000193 + current_num_rows) % partitioning.partition_count();
 
     // compute partition indices
-    let mut partition_indices = batches
+    let partition_indices = batches
         .iter()
         .enumerate()
         .flat_map(|(batch_idx, batch)| {
@@ -330,31 +334,38 @@ fn sort_batches_by_partition_id(
         })
         .collect::<Vec<_>>();
 
-    // sort
-    let mut part_counts = vec![0; num_partitions];
-    radix_sort_by_key(
-        &mut partition_indices,
-        &mut part_counts,
-        |&(part_id, ..)| part_id as usize,
-    );
+    // group rows by partition id with a stable counting sort, so rows of the same
+    // partition keep their input order. An in-place (unstable) sort scrambles them,
+    // which hurts compression of sorted or clustered data (apache/auron#1782).
+    let mut part_counts = vec![0usize; num_partitions];
+    for &(part_id, ..) in &partition_indices {
+        part_counts[part_id as usize] += 1;
+    }
 
     // compute partitions
     let mut partition_offsets = Vec::with_capacity(num_partitions + 1);
     let mut offset = 0;
-    for part_count in part_counts {
+    for &part_count in &part_counts {
         partition_offsets.push(offset);
         offset += part_count as u32;
     }
     partition_offsets.push(offset);
 
+    // place rows at their partition's next slot, in input order
+    let mut next_slots = partition_offsets[..num_partitions]
+        .iter()
+        .map(|&o| o as usize)
+        .collect::<Vec<_>>();
+    let mut sorted_indices = vec![(0usize, 0usize); partition_indices.len()];
+    for (part_id, batch_idx, row_idx) in partition_indices {
+        let slot = &mut next_slots[part_id as usize];
+        sorted_indices[*slot] = (batch_idx as usize, row_idx as usize);
+        *slot += 1;
+    }
+
     // get sorted batch
     let batches_interleaver = create_batch_interleaver(&batches, true)?;
-    let sorted_batch = batches_interleaver(
-        &partition_indices
-            .into_iter()
-            .map(|(_, batch_idx, row_idx)| (batch_idx as usize, row_idx as usize))
-            .collect::<Vec<_>>(),
-    )?;
+    let sorted_batch = batches_interleaver(&sorted_indices)?;
     return Ok((partition_offsets, sorted_batch));
 }
 
@@ -430,6 +441,68 @@ mod test {
         Ok(())
     }
 
+    #[test]
+    fn test_partitions_keep_input_order() -> Result<()> {
+        // Within each output partition, rows must be written in input order, across
+        // sorted batches and within each batch. Keeping input order makes sorted or
+        // clustered keys compress much better (apache/auron#1782).
+        let rows_per_input = 1000;
+        let probe = (0..rows_per_input).collect::<Vec<i32>>();
+        let probe = build_table_i32(("a", &probe), ("b", &probe), ("c", &probe))?;
+        let batches_per_flush = compute_suggested_batch_size_for_output(
+            probe.get_batch_mem_size() * 2,
+            probe.num_rows(),
+        )
+        .div_ceil(rows_per_input as usize);
+        let num_sorted_batches = 4;
+        let total_rows = batches_per_flush * num_sorted_batches * rows_per_input as usize;
+
+        let partitionings = [
+            Partitioning::RoundRobinPartitioning(4),
+            // hash partitioning spreads rows unevenly, so batches have different
+            // sets of empty partitions
+            Partitioning::HashPartitioning(vec![Arc::new(Column::new("a", 0))], 7),
+        ];
+        for partitioning in partitionings {
+            let mut buffered_data = BufferedData::new(partitioning.clone(), 0, Time::new());
+            for i in 0..batches_per_flush * num_sorted_batches {
+                let start = i as i32 * rows_per_input;
+                let values = (start..start + rows_per_input).collect::<Vec<_>>();
+                buffered_data.add_batch(build_table_i32(
+                    ("a", &values),
+                    ("b", &values),
+                    ("c", &values),
+                )?)?;
+            }
+            assert_eq!(buffered_data.sorted_batches.len(), num_sorted_batches);
+
+            let mut iter = buffered_data.into_sorted_batches()?;
+            let mut num_rows = 0;
+            while let Some((partition_id, batch_iter)) = iter.next_partition_chunk() {
+                let mut prev: Option<i32> = None;
+                for batch in batch_iter {
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .expect("Int32Array");
+                    for &v in col.values() {
+                        if let Some(p) = prev {
+                            assert!(
+                                v > p,
+                                "{partitioning}: partition {partition_id} wrote row {v} after row {p}"
+                            );
+                        }
+                        prev = Some(v);
+                        num_rows += 1;
+                    }
+                }
+            }
+            assert_eq!(num_rows, total_rows, "{partitioning}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_round_robin() -> Result<()> {
         let record_batch = build_table_i32(
@@ -442,6 +515,7 @@ mod test {
         let (_parts, sorted_batch) =
             sort_batches_by_partition_id(vec![record_batch], &round_robin_partitioning, 3, 0)?;
 
+        // rows of each partition keep their input order
         let expected = vec![
             "+----+---+---+",
             "| a  | b | c |",
@@ -451,8 +525,8 @@ mod test {
             "| 10 | 9 | 4 |",
             "| 17 | 2 | 7 |",
             "| 13 | 6 | 1 |",
-            "| 12 | 7 | 2 |",
             "| 16 | 3 | 8 |",
+            "| 12 | 7 | 2 |",
             "| 19 | 0 | 5 |",
             "| 15 | 4 | 9 |",
             "| 11 | 8 | 3 |",
