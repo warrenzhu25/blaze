@@ -1248,4 +1248,19 @@ class AuronQuerySuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQ
       checkSparkAnswerAndOperator("select * from orc_or where id = 5 or b = 900000")
     }
   }
+
+  test("scan orc table with all-null string column") {
+    // An all-NULL string column produces zero-length ORC streams. Reading them must not
+    // go through the JNI read path with an empty buffer (apache/auron#2586), which used to
+    // corrupt memory and crash the executor.
+    withTable("orc_all_null_2586") {
+      sql("create table orc_all_null_2586(id bigint, s string, t string) using orc")
+      sql("""insert into orc_all_null_2586
+        |select id, cast(null as string), cast(id as string) from range(0, 100000)
+        |""".stripMargin)
+      checkSparkAnswerAndOperator(
+        "select count(*), count(s), sum(hash(s)) from orc_all_null_2586")
+      checkSparkAnswerAndOperator("select id, s, t from orc_all_null_2586 where id % 9973 = 0")
+    }
+  }
 }

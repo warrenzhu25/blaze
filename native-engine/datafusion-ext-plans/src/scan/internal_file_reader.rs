@@ -62,6 +62,12 @@ impl InternalFileReader {
     }
 
     pub fn read_fully(&self, range: Range<u64>) -> Result<Bytes> {
+        // Zero-length reads are legitimate (e.g. ORC streams of an all-NULL column).
+        // Return early: there is nothing to read, and the JNI path below must never
+        // be handed an empty buffer.
+        if range.is_empty() {
+            return Ok(Bytes::new());
+        }
         let mut bytes = Vec::uninitialized_init((range.end - range.start) as usize);
         self.get_input()?.read_fully(range.start, &mut bytes)?;
         Ok(Bytes::from(bytes))

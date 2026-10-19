@@ -152,10 +152,10 @@ macro_rules! jni_new_direct_byte_buffer {
         $crate::jni_bridge::THREAD_JNIENV.with(|env| unsafe {
             $crate::jni_map_error_with_env!(
                 env,
-                env.new_direct_byte_buffer(
-                    unsafe { $value.get_unchecked(0) as *const u8 as *mut u8 },
-                    $value.len()
-                )
+                // `as_ptr()` is valid for empty slices too (dangling but non-null),
+                // unlike `get_unchecked(0)`, which is undefined behavior on an empty
+                // slice and lets the compiler assume the slice is non-empty.
+                env.new_direct_byte_buffer($value.as_ptr() as *mut u8, $value.len())
             )
             .map(|s| $crate::jni_bridge::LocalRef(s.into()))
         })
