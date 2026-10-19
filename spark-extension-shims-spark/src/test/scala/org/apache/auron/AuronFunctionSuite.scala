@@ -95,6 +95,24 @@ class AuronFunctionSuite extends AuronQueryTest with BaseAuronSQLSuite {
     }
   }
 
+  test("hash and xxhash64 of float and double NaN and negative zero") {
+    withTable("t1") {
+      sql("""
+          |create table t1 using parquet as
+          |select cast(s as float) as f, cast(s as double) as d
+          |from values ('0.0'), ('-0.0'), ('NaN'), ('1.5'), (null) as v(s)
+          |""".stripMargin)
+      // -f and -d produce negative NaN and turn 0.0 into -0.0
+      checkSparkAnswerAndOperator("""
+          |select
+          |  hash(f), hash(d), xxhash64(f), xxhash64(d),
+          |  hash(-f), hash(-d), xxhash64(-f), xxhash64(-d),
+          |  hash(array(-f)), hash(named_struct('d', -d))
+          |from t1
+          |""".stripMargin)
+    }
+  }
+
   test("flatten function with mixed child array nullability") {
     withTable("t1") {
       sql("""

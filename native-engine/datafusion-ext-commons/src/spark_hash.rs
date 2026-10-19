@@ -15,6 +15,8 @@
 
 //! Functionality used both on logical and physical plans
 
+use std::sync::OnceLock;
+
 use arrow::{
     array::*,
     datatypes::{
@@ -22,8 +24,42 @@ use arrow::{
         Int64Type, TimeUnit,
     },
 };
+use auron_jni_bridge::conf::{BooleanConf, HASH_NORMALIZE_NEGATIVE_ZERO};
 
 use crate::hash::{mur::spark_compatible_murmur3_hash, xxhash::spark_compatible_xxhash64_hash};
+
+/// Whether -0.0 is hashed as 0.0, as Spark does since 3.2 (SPARK-35207).
+/// The value only depends on the Spark version, so it is read once.
+fn normalize_negative_zero() -> bool {
+    static NORMALIZE: OnceLock<bool> = OnceLock::new();
+    *NORMALIZE.get_or_init(|| HASH_NORMALIZE_NEGATIVE_ZERO.value().unwrap_or(true))
+}
+
+/// Bits of a float as hashed by Spark: `Float.floatToIntBits`, which maps all
+/// NaNs to the canonical NaN, plus -0.0 mapped to 0.0 if `normalize_zero`.
+#[inline]
+fn spark_f32_bits(v: f32, normalize_zero: bool) -> u32 {
+    if v.is_nan() {
+        0x7fc0_0000
+    } else if normalize_zero && v == 0.0 {
+        0
+    } else {
+        v.to_bits()
+    }
+}
+
+/// Bits of a double as hashed by Spark: `Double.doubleToLongBits`, which maps
+/// all NaNs to the canonical NaN, plus -0.0 mapped to 0.0 if `normalize_zero`.
+#[inline]
+fn spark_f64_bits(v: f64, normalize_zero: bool) -> u64 {
+    if v.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else if normalize_zero && v == 0.0 {
+        0
+    } else {
+        v.to_bits()
+    }
+}
 
 pub fn create_murmur3_hashes(len: usize, arrays: &[ArrayRef], seed: i32) -> Vec<i32> {
     create_hashes(len, arrays, seed, |data: &[u8], seed: i32| {
@@ -107,6 +143,35 @@ fn hash_array<T: num::PrimInt>(
         };
     }
 
+    macro_rules! hash_array_float {
+        (
+            $array_type:ident,
+            $column:ident,
+            $bits:ident,
+            $normalize_zero:expr,
+            $hashes:ident,
+            $h:expr
+        ) => {
+            let array = $column
+                .as_any()
+                .downcast_ref::<$array_type>()
+                .expect("downcast to expected array type failed");
+            let values = array.values();
+
+            if array.null_count() == 0 {
+                for (hash, value) in $hashes.iter_mut().zip(values.iter()) {
+                    *hash = $h($bits(*value, $normalize_zero).to_le_bytes().as_ref(), *hash);
+                }
+            } else {
+                for (i, (hash, value)) in $hashes.iter_mut().zip(values.iter()).enumerate() {
+                    if !array.is_null(i) {
+                        *hash = $h($bits(*value, $normalize_zero).to_le_bytes().as_ref(), *hash);
+                    }
+                }
+            }
+        };
+    }
+
     macro_rules! hash_array_decimal {
         ($array_type:ident, $column:ident, $hashes:ident, $h:expr) => {
             let array = $column
@@ -170,10 +235,26 @@ fn hash_array<T: num::PrimInt>(
             hash_array_primitive!(Int64Array, array, i64, hashes_buffer, h);
         }
         DataType::Float32 => {
-            hash_array_primitive!(Float32Array, array, f32, hashes_buffer, h);
+            let normalize_zero = normalize_negative_zero();
+            hash_array_float!(
+                Float32Array,
+                array,
+                spark_f32_bits,
+                normalize_zero,
+                hashes_buffer,
+                h
+            );
         }
         DataType::Float64 => {
-            hash_array_primitive!(Float64Array, array, f64, hashes_buffer, h);
+            let normalize_zero = normalize_negative_zero();
+            hash_array_float!(
+                Float64Array,
+                array,
+                spark_f64_bits,
+                normalize_zero,
+                hashes_buffer,
+                h
+            );
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
             hash_array_primitive!(TimestampSecondArray, array, i64, hashes_buffer, h);
@@ -314,10 +395,20 @@ fn hash_one<T: num::PrimInt>(
                 hash_one_primitive!(Int64Array, col, i64, hash, idx, h);
             }
             DataType::Float32 => {
-                hash_one_primitive!(Float32Array, col, f32, hash, idx, h);
+                let array = col
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("Expected a Float32Array");
+                let bits = spark_f32_bits(array.value(idx), normalize_negative_zero());
+                *hash = h(bits.to_le_bytes().as_ref(), *hash);
             }
             DataType::Float64 => {
-                hash_one_primitive!(Float64Array, col, f64, hash, idx, h);
+                let array = col
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("Expected a Float64Array");
+                let bits = spark_f64_bits(array.value(idx), normalize_negative_zero());
+                *hash = h(bits.to_le_bytes().as_ref(), *hash);
             }
             DataType::Timestamp(TimeUnit::Second, None) => {
                 hash_one_primitive!(TimestampSecondArray, col, i64, hash, idx, h);
@@ -517,6 +608,73 @@ mod tests {
             -235771157374669727,
         ];
         assert_eq!(hashes, expected);
+    }
+
+    #[test]
+    fn test_float_nan_and_negative_zero() {
+        // f32 bit patterns: 0.0, -0.0, canonical NaN, negative NaN, NaN with payload,
+        // 1.5
+        let floats = Arc::new(Float32Array::from(
+            [
+                0x0000_0000_u32,
+                0x8000_0000,
+                0x7fc0_0000,
+                0xffc0_0000,
+                0x7f80_0001,
+                0x3fc0_0000,
+            ]
+            .into_iter()
+            .map(f32::from_bits)
+            .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let doubles = Arc::new(Float64Array::from(
+            [
+                0x0000_0000_0000_0000_u64,
+                0x8000_0000_0000_0000,
+                0x7ff8_0000_0000_0000,
+                0xfff8_0000_0000_0000,
+                0x7ff0_0000_0000_0001,
+                0x3ff8_0000_0000_0000,
+            ]
+            .into_iter()
+            .map(f64::from_bits)
+            .collect::<Vec<_>>(),
+        )) as ArrayRef;
+
+        // generated with Spark 3.5: hash(), xxhash64() of the same values
+        let (f_zero, f_nan, f_one_half) = (933211791, -349261430, -221251528);
+        let (d_zero, d_nan, d_one_half) = (-1670924195, -1281358385, 1290763749);
+        assert_eq!(
+            create_murmur3_hashes(6, &[floats.clone()], 42),
+            vec![f_zero, f_zero, f_nan, f_nan, f_nan, f_one_half]
+        );
+        assert_eq!(
+            create_murmur3_hashes(6, &[doubles.clone()], 42),
+            vec![d_zero, d_zero, d_nan, d_nan, d_nan, d_one_half]
+        );
+        let (xd_zero, xd_nan) = (-5252525462095825812, -3127944061524951246);
+        let xd = create_xxhash64_hashes(6, &[doubles.clone()], 42);
+        assert_eq!(&xd[..5], &[xd_zero, xd_zero, xd_nan, xd_nan, xd_nan]);
+        let (xf_zero, xf_nan) = (3614696996920510707, 2692338816207849720);
+        let xf = create_xxhash64_hashes(6, &[floats.clone()], 42);
+        assert_eq!(&xf[..5], &[xf_zero, xf_zero, xf_nan, xf_nan, xf_nan]);
+
+        // the per-value path (used for nested types) must agree
+        for array in [&floats, &doubles] {
+            let expected = create_murmur3_hashes(6, &[array.clone()], 42);
+            for (i, expected) in expected.into_iter().enumerate() {
+                let mut hash = 42;
+                hash_one(array, i, &mut hash, |data: &[u8], seed: i32| {
+                    spark_compatible_murmur3_hash(data, seed)
+                });
+                assert_eq!(hash, expected);
+            }
+        }
+
+        // without -0.0 normalization (Spark < 3.2), only NaN is canonicalized
+        assert_ne!(spark_f32_bits(-0.0, false), spark_f32_bits(0.0, false));
+        assert_ne!(spark_f64_bits(-0.0, false), spark_f64_bits(0.0, false));
+        assert_eq!(spark_f64_bits(-f64::NAN, false), 0x7ff8_0000_0000_0000);
     }
 
     #[test]

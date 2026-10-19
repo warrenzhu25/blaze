@@ -25,6 +25,7 @@ import org.apache.spark.SparkContext;
 import org.apache.spark.SparkEnv;
 import org.apache.spark.auron.spark.configurations.ConfigEntryWithDefaultFunction;
 import org.apache.spark.internal.config.ConfigEntry;
+import org.apache.spark.sql.auron.Shims$;
 import org.apache.spark.sql.internal.SQLConf;
 import scala.Option;
 import scala.collection.mutable.ListBuffer;
@@ -193,6 +194,14 @@ public class SparkAuronConfiguration extends AuronConfiguration {
                     "Compression codec used for Spark I/O operations. Common options include lz4, snappy, gzip, and zstd. "
                             + "The choice of codec affects both compression ratio and decompression speed.")
             .withDynamicDefaultValue(_conf -> SparkEnv.get().conf().get("spark.io.compression.codec", "lz4"));
+
+    public static final ConfigOption<Boolean> HASH_NORMALIZE_NEGATIVE_ZERO = new ConfigOption<>(Boolean.class)
+            .withKey("auron.hash.normalizeNegativeZero")
+            .withCategory("Runtime Configuration")
+            .withDescription("Whether hash(), xxhash64() and native hash partitioning hash float and double -0.0 "
+                    + "the same as 0.0. Spark does this since 3.2 (SPARK-35207), so the default follows the "
+                    + "running Spark version. NaN values are always hashed as the canonical NaN, like Spark.")
+            .withDynamicDefaultValue(_conf -> Shims$.MODULE$.get().shimVersion().compareTo("spark-3.2") >= 0);
 
     public static final ConfigOption<Integer> SPARK_IO_COMPRESSION_ZSTD_LEVEL = new ConfigOption<>(Integer.class)
             .withKey("io.compression.zstd.level")
