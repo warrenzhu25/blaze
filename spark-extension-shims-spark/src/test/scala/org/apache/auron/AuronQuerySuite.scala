@@ -1248,4 +1248,31 @@ class AuronQuerySuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQ
       checkSparkAnswerAndOperator("select * from orc_or where id = 5 or b = 900000")
     }
   }
+
+  test("orc predicate pushdown keeps row groups containing nulls") {
+    // Spark adds `isnotnull(col)` for every filtered column. It used to be pushed into the
+    // ORC reader as NOT(IS NULL), which skips every row group that contains a NULL, even
+    // when that row group also holds matching rows.
+    withTable("orc_nulls_pushdown") {
+      sql("create table orc_nulls_pushdown(id int, s string) using orc")
+      // ~100 row groups (default stride 10000), every row group has NULLs and values
+      sql("""insert into orc_nulls_pushdown
+        |select
+        |  if(id % 97 = 0, null, cast(id % 100 as int)),
+        |  if(id % 89 = 0, null, concat('v', cast(id % 50 as string)))
+        |from range(0, 1000000, 1, 1)
+        |""".stripMargin)
+      Seq(
+        "select count(*) from orc_nulls_pushdown where s = 'v7'",
+        "select count(*) from orc_nulls_pushdown where id > 50",
+        "select count(*) from orc_nulls_pushdown where id = 42 and s is not null",
+        "select count(*) from orc_nulls_pushdown where not (id < 10)",
+        "select count(*) from orc_nulls_pushdown where id not in (1, 2, 3)",
+        "select count(*) from orc_nulls_pushdown where s in ('v1', 'v2')",
+        "select count(*) from orc_nulls_pushdown where id is null",
+        "select count(*) from orc_nulls_pushdown where not (s is null)").foreach { q =>
+        checkSparkAnswerAndOperator(q)
+      }
+    }
+  }
 }

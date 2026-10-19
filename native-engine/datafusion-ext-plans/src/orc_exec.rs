@@ -637,7 +637,7 @@ fn convert_expr_to_orc_internal(
                     let col_name = field.name().as_str();
                     return Some(Predicate::and(vec![
                         Predicate::is_null(col_name),
-                        Predicate::not(Predicate::is_null(col_name)),
+                        Predicate::is_not_null(col_name),
                     ]));
                 }
                 // Fallback: no columns in schema, can't create a predicate
@@ -645,7 +645,7 @@ fn convert_expr_to_orc_internal(
                 let col_name = "__orc_where_false_constant__";
                 return Some(Predicate::and(vec![
                     Predicate::is_null(col_name),
-                    Predicate::not(Predicate::is_null(col_name)),
+                    Predicate::is_not_null(col_name),
                 ]));
             }
             _ => {
@@ -654,12 +654,15 @@ fn convert_expr_to_orc_internal(
         }
     }
 
-    // Handle NOT expressions (WHERE NOT condition)
+    // Handle NOT expressions (WHERE NOT condition).
+    //
+    // A pushed predicate is evaluated per row group as "may this row group contain
+    // a matching row?". Negating such an answer is unsound: NOT(may contain
+    // NULLs) is not "may contain non-NULLs", so wrapping a predicate in
+    // `Predicate::not` would skip row groups that hold matching rows. Only push
+    // NOT when it can be rewritten into an equivalent non-negated predicate.
     if let Some(not_expr) = expr.as_any().downcast_ref::<NotExpr>() {
-        if let Some(inner_pred) = convert_expr_to_orc(not_expr.arg(), schema) {
-            return Some(Predicate::not(inner_pred));
-        }
-        return None;
+        return convert_negated_expr_to_orc(not_expr.arg(), schema);
     }
 
     // Handle IS NULL expressions
@@ -675,7 +678,7 @@ fn convert_expr_to_orc_internal(
     if let Some(is_not_null) = expr.as_any().downcast_ref::<IsNotNullExpr>() {
         if let Some(col) = is_not_null.arg().as_any().downcast_ref::<Column>() {
             let col_name = col.name();
-            return Some(Predicate::not(Predicate::is_null(col_name)));
+            return Some(Predicate::is_not_null(col_name));
         }
         return None;
     }
@@ -685,26 +688,33 @@ fn convert_expr_to_orc_internal(
         if let Some(col) = in_list.expr().as_any().downcast_ref::<Column>() {
             let col_name = col.name();
 
-            // Convert IN to multiple OR conditions: col = val1 OR col = val2 OR ...
-            let mut predicates = Vec::new();
+            // Every list value must be convertible: dropping a value from IN narrows the
+            // predicate and would skip row groups containing the dropped value.
+            let mut values = Vec::new();
             for list_expr in in_list.list() {
-                if let Some(lit) = list_expr.as_any().downcast_ref::<Literal>() {
-                    if let Some(pred_value) = convert_scalar_value(lit.value()) {
-                        predicates.push(Predicate::eq(col_name, pred_value));
-                    }
-                }
+                let lit = list_expr.as_any().downcast_ref::<Literal>()?;
+                values.push(convert_scalar_value(lit.value())?);
             }
-
-            if predicates.is_empty() {
+            if values.is_empty() {
                 return None;
             }
 
-            // If negated is true, it represents NOT IN
             if in_list.negated() {
-                return Some(Predicate::not(Predicate::or(predicates)));
-            } else {
-                return Some(Predicate::or(predicates));
+                // NOT IN (v1, v2, ...) => col != v1 AND col != v2 AND ...
+                return Some(Predicate::and(
+                    values
+                        .into_iter()
+                        .map(|v| Predicate::ne(col_name, v))
+                        .collect(),
+                ));
             }
+            // IN (v1, v2, ...) => col = v1 OR col = v2 OR ...
+            return Some(Predicate::or(
+                values
+                    .into_iter()
+                    .map(|v| Predicate::eq(col_name, v))
+                    .collect(),
+            ));
         }
         return None;
     }
@@ -734,6 +744,61 @@ fn convert_expr_to_orc_internal(
                 let value = lit.value();
                 return build_comparison_predicate_reversed(col_name, op, value);
             }
+        }
+    }
+
+    None
+}
+
+/// Converts `NOT expr` into an equivalent predicate without `Predicate::not`,
+/// or returns `None` if that is not possible (the filter is then not pushed
+/// down, which is always safe because the scan's output is still filtered).
+fn convert_negated_expr_to_orc(
+    expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    schema: &SchemaRef,
+) -> Option<Predicate> {
+    // NOT (col IS NULL) => col IS NOT NULL
+    if let Some(is_null) = expr.as_any().downcast_ref::<IsNullExpr>() {
+        let col = is_null.arg().as_any().downcast_ref::<Column>()?;
+        return Some(Predicate::is_not_null(col.name()));
+    }
+
+    // NOT (col IS NOT NULL) => col IS NULL
+    if let Some(is_not_null) = expr.as_any().downcast_ref::<IsNotNullExpr>() {
+        let col = is_not_null.arg().as_any().downcast_ref::<Column>()?;
+        return Some(Predicate::is_null(col.name()));
+    }
+
+    // NOT (NOT expr) => expr
+    if let Some(not_expr) = expr.as_any().downcast_ref::<NotExpr>() {
+        return convert_expr_to_orc(not_expr.arg(), schema);
+    }
+
+    // NOT (col <op> literal) => col <negated op> literal. Rows where col is NULL
+    // satisfy neither form, so the negated comparison selects exactly the same
+    // rows.
+    if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        let negated_op = match binary.op() {
+            Operator::Eq => Operator::NotEq,
+            Operator::NotEq => Operator::Eq,
+            Operator::Lt => Operator::GtEq,
+            Operator::LtEq => Operator::Gt,
+            Operator::Gt => Operator::LtEq,
+            Operator::GtEq => Operator::Lt,
+            _ => return None,
+        };
+        let (left, right) = (binary.left(), binary.right());
+        if let (Some(col), Some(lit)) = (
+            left.as_any().downcast_ref::<Column>(),
+            right.as_any().downcast_ref::<Literal>(),
+        ) {
+            return build_comparison_predicate(col.name(), &negated_op, lit.value());
+        }
+        if let (Some(lit), Some(col)) = (
+            left.as_any().downcast_ref::<Literal>(),
+            right.as_any().downcast_ref::<Column>(),
+        ) {
+            return build_comparison_predicate_reversed(col.name(), &negated_op, lit.value());
         }
     }
 
@@ -986,7 +1051,7 @@ mod tests {
         let result = convert_predicate_to_orc(Some(expr), &schema);
         assert!(result.is_some());
         let predicate = result.expect("Expected valid ORC predicate");
-        assert_eq!(format!("{predicate:?}"), "Not(IsNull { column: \"age\" })");
+        assert_eq!(format!("{predicate:?}"), "IsNotNull { column: \"age\" }");
     }
 
     #[test]
@@ -1000,7 +1065,94 @@ mod tests {
         let result = convert_predicate_to_orc(Some(not_expr), &schema);
         assert!(result.is_some());
         let predicate = result.expect("Expected valid ORC predicate");
-        assert!(format!("{predicate:?}").starts_with("Not(Comparison"));
+        // NOT (id = 42) is rewritten to id != 42, never wrapped in Predicate::not
+        assert_eq!(
+            format!("{predicate:?}"),
+            "Comparison { column: \"id\", op: NotEqual, value: Int32(Some(42)) }"
+        );
+    }
+
+    #[test]
+    fn test_negations_are_rewritten_without_not() {
+        let schema = create_test_schema();
+        let age = Arc::new(Column::new("age", 2));
+        let lit = Arc::new(Literal::new(ScalarValue::Int32(Some(30))));
+        let convert = |e: Arc<dyn datafusion::physical_expr::PhysicalExpr>| {
+            convert_predicate_to_orc(Some(Arc::new(NotExpr::new(e))), &schema)
+                .map(|p| format!("{p:?}"))
+        };
+
+        // NOT (age IS NULL) => age IS NOT NULL
+        assert_eq!(
+            convert(Arc::new(IsNullExpr::new(age.clone()))).as_deref(),
+            Some("IsNotNull { column: \"age\" }")
+        );
+        // NOT (age IS NOT NULL) => age IS NULL
+        assert_eq!(
+            convert(Arc::new(IsNotNullExpr::new(age.clone()))).as_deref(),
+            Some("IsNull { column: \"age\" }")
+        );
+        // NOT (age < 30) => age >= 30
+        assert_eq!(
+            convert(Arc::new(BinaryExpr::new(
+                age.clone(),
+                Operator::Lt,
+                lit.clone()
+            )))
+            .as_deref(),
+            Some("Comparison { column: \"age\", op: GreaterThanOrEqual, value: Int32(Some(30)) }")
+        );
+        // NOT (30 < age) => age <= 30
+        assert_eq!(
+            convert(Arc::new(BinaryExpr::new(
+                lit.clone(),
+                Operator::Lt,
+                age.clone()
+            )))
+            .as_deref(),
+            Some("Comparison { column: \"age\", op: LessThanOrEqual, value: Int32(Some(30)) }")
+        );
+        // NOT (NOT (age = 30)) => age = 30
+        let eq = Arc::new(BinaryExpr::new(age.clone(), Operator::Eq, lit.clone()));
+        assert_eq!(
+            convert(Arc::new(NotExpr::new(eq))).as_deref(),
+            Some("Comparison { column: \"age\", op: Equal, value: Int32(Some(30)) }")
+        );
+    }
+
+    #[test]
+    fn test_unrewritable_negations_are_not_pushed() {
+        let schema = create_test_schema();
+        let age = Arc::new(Column::new("age", 2));
+        let id = Arc::new(Column::new("id", 0));
+        let lit = Arc::new(Literal::new(ScalarValue::Int32(Some(30))));
+        // NOT (age > 30 AND id = 30) cannot be expressed without Predicate::not
+        let and_expr = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(age, Operator::Gt, lit.clone())),
+            Operator::And,
+            Arc::new(BinaryExpr::new(id, Operator::Eq, lit)),
+        ));
+        let result = convert_predicate_to_orc(Some(Arc::new(NotExpr::new(and_expr))), &schema);
+        assert!(result.is_none(), "got: {result:?}");
+    }
+
+    #[test]
+    fn test_in_list_with_unconvertible_value_not_pushed() {
+        let schema = create_test_schema();
+        let col = Arc::new(Column::new("id", 0));
+        // a decimal literal has no ORC PredicateValue: dropping it would narrow the IN
+        // list
+        let values = vec![
+            Arc::new(Literal::new(ScalarValue::Int32(Some(1))))
+                as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            Arc::new(Literal::new(ScalarValue::Decimal128(Some(200), 5, 2)))
+                as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ];
+        for negated in [false, true] {
+            let expr = Arc::new(InListExpr::new(col.clone(), values.clone(), negated, None));
+            let result = convert_predicate_to_orc(Some(expr), &schema);
+            assert!(result.is_none(), "negated={negated}, got: {result:?}");
+        }
     }
 
     #[test]
@@ -1039,8 +1191,11 @@ mod tests {
         let result = convert_predicate_to_orc(Some(expr), &schema);
         assert!(result.is_some());
         let predicate = result.expect("Expected valid ORC predicate");
-        // NOT IN should be converted to NOT(OR(...))
-        assert!(format!("{predicate:?}").starts_with("Not(Or(["));
+        // NOT IN should be converted to AND of != predicates
+        let debug_str = format!("{predicate:?}");
+        assert!(debug_str.starts_with("And(["), "got: {debug_str}");
+        assert!(debug_str.contains("NotEqual"), "got: {debug_str}");
+        assert!(!debug_str.contains("Not("), "got: {debug_str}");
     }
 
     #[test]
@@ -1278,11 +1433,13 @@ mod tests {
         assert!(debug_str.contains("And"), "Expected And, got: {debug_str}");
         // Should contain OR for the id conditions
         assert!(debug_str.contains("Or"), "Expected Or, got: {debug_str}");
-        // Should contain the IS NOT NULL condition
+        // Should contain the IS NOT NULL condition, pushed as IsNotNull (not as
+        // Not(IsNull))
         assert!(
-            debug_str.contains("IsNull"),
-            "Expected IsNull, got: {debug_str}",
+            debug_str.contains("IsNotNull { column: \"name\" }"),
+            "Expected IsNotNull, got: {debug_str}",
         );
+        assert!(!debug_str.contains("Not("), "got: {debug_str}");
     }
 
     #[test]
@@ -1475,8 +1632,8 @@ mod tests {
         assert!(result.is_some());
         let predicate = result.expect("Expected valid ORC predicate");
         let debug_str = format!("{predicate:?}");
-        // Should be NOT(OR(...))
-        assert!(debug_str.starts_with("Not(Or(["));
+        // Should be AND of != predicates
+        assert!(debug_str.starts_with("And(["), "got: {debug_str}");
     }
 
     #[test]
