@@ -108,7 +108,7 @@ fn hash_array<T: num::PrimInt>(
     }
 
     macro_rules! hash_array_decimal {
-        ($array_type:ident, $column:ident, $hashes:ident, $h:expr) => {
+        ($array_type:ident, $column:ident, $precision:expr, $hashes:ident, $h:expr) => {
             let array = $column
                 .as_any()
                 .downcast_ref::<$array_type>()
@@ -116,12 +116,12 @@ fn hash_array<T: num::PrimInt>(
 
             if array.null_count() == 0 {
                 for (i, hash) in $hashes.iter_mut().enumerate() {
-                    *hash = $h(array.value(i).to_le_bytes().as_ref(), *hash);
+                    *hash = hash_decimal(array.value(i), $precision, *hash, $h);
                 }
             } else {
                 for (i, hash) in $hashes.iter_mut().enumerate() {
                     if !array.is_null(i) {
-                        *hash = $h(array.value(i).to_le_bytes().as_ref(), *hash);
+                        *hash = hash_decimal(array.value(i), $precision, *hash, $h);
                     }
                 }
             }
@@ -205,8 +205,8 @@ fn hash_array<T: num::PrimInt>(
         DataType::LargeUtf8 => {
             hash_array!(LargeStringArray, array, hashes_buffer, h);
         }
-        DataType::Decimal128(..) => {
-            hash_array_decimal!(Decimal128Array, array, hashes_buffer, h);
+        DataType::Decimal128(precision, _) => {
+            hash_array_decimal!(Decimal128Array, array, *precision, hashes_buffer, h);
         }
         DataType::Dictionary(index_type, _) => match index_type.as_ref() {
             DataType::Int8 => create_hashes_dictionary::<Int8Type, _>(array, hashes_buffer, h),
@@ -246,6 +246,36 @@ fn create_hashes_dictionary<K: ArrowDictionaryKeyType, T: num::PrimInt>(
     }
 }
 
+/// Hashes a decimal value the same way as Spark's `Murmur3Hash` and `XxHash64`:
+/// decimals with precision <= 18 (`Decimal.MAX_LONG_DIGITS`) are hashed as
+/// their unscaled `long` value, larger ones as the bytes of
+/// `BigInteger.toByteArray()` of the unscaled value, i.e. the minimal
+/// big-endian two's-complement representation.
+#[inline]
+fn hash_decimal<T: num::PrimInt>(
+    unscaled: i128,
+    precision: u8,
+    hash: T,
+    h: impl Fn(&[u8], T) -> T,
+) -> T {
+    if precision <= 18 {
+        return h((unscaled as i64).to_le_bytes().as_ref(), hash);
+    }
+    let bytes = unscaled.to_be_bytes();
+    // drop leading sign-extension bytes, keeping at least one byte and the
+    // sign bit of the first remaining byte
+    let mut start = 0;
+    while start < bytes.len() - 1 {
+        let (b, next) = (bytes[start], bytes[start + 1]);
+        if (b == 0x00 && next & 0x80 == 0) || (b == 0xff && next & 0x80 != 0) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    h(&bytes[start..], hash)
+}
+
 #[allow(clippy::panic)] // Temporarily allow panic to refactor to Result later
 fn hash_one<T: num::PrimInt>(
     col: &ArrayRef,
@@ -277,12 +307,12 @@ fn hash_one<T: num::PrimInt>(
     }
 
     macro_rules! hash_one_decimal {
-        ($array_type:ident, $column:ident, $hash:ident, $idx:ident, $h:expr) => {
+        ($array_type:ident, $column:ident, $precision:expr, $hash:ident, $idx:ident, $h:expr) => {
             let array = $column
                 .as_any()
                 .downcast_ref::<$array_type>()
                 .expect("downcast to expected array type failed");
-            *$hash = $h(array.value($idx as usize).to_le_bytes().as_ref(), *$hash);
+            *$hash = hash_decimal(array.value($idx as usize), $precision, *$hash, $h);
         };
     }
 
@@ -349,8 +379,8 @@ fn hash_one<T: num::PrimInt>(
             DataType::LargeUtf8 => {
                 hash_one_binary!(LargeStringArray, col, hash, idx, h);
             }
-            DataType::Decimal128(..) => {
-                hash_one_decimal!(Decimal128Array, col, hash, idx, h);
+            DataType::Decimal128(precision, _) => {
+                hash_one_decimal!(Decimal128Array, col, *precision, hash, idx, h);
             }
             DataType::List(..) => {
                 let list_array = col
@@ -517,6 +547,89 @@ mod tests {
             -235771157374669727,
         ];
         assert_eq!(hashes, expected);
+    }
+
+    #[test]
+    fn test_decimal() {
+        // (unscaled small DECIMAL(5,2), unscaled big DECIMAL(25,2))
+        let values: [(i128, i128); 6] = [
+            (123, 123),
+            (-500, -500),
+            (0, 0),
+            (99999, 1234567890123456789012345),
+            (-99999, -1234567890123456789012345),
+            (128, -128),
+        ];
+        let small = Arc::new(
+            Decimal128Array::from(values.iter().map(|v| v.0).collect::<Vec<_>>())
+                .with_precision_and_scale(5, 2)
+                .expect("valid precision"),
+        ) as ArrayRef;
+        let big = Arc::new(
+            Decimal128Array::from(values.iter().map(|v| v.1).collect::<Vec<_>>())
+                .with_precision_and_scale(25, 2)
+                .expect("valid precision"),
+        ) as ArrayRef;
+
+        // generated with Spark: SELECT hash(d), xxhash64(d)
+        assert_eq!(
+            create_murmur3_hashes(6, &[small.clone()], 42),
+            vec![
+                -46242105,
+                527864534,
+                -1670924195,
+                790288776,
+                -1506032102,
+                -1794377518
+            ]
+        );
+        assert_eq!(
+            create_murmur3_hashes(6, &[big.clone()], 42),
+            vec![
+                -1536290115,
+                -183890408,
+                -783713497,
+                992557280,
+                -241151136,
+                775851899
+            ]
+        );
+        assert_eq!(
+            create_xxhash64_hashes(6, &[small.clone()], 42),
+            vec![
+                -3178482946328430151,
+                -6097726428768335688,
+                -5252525462095825812,
+                861828129687809931,
+                6475158450212929761,
+                -4045576785621496215
+            ]
+        );
+        assert_eq!(
+            create_xxhash64_hashes(6, &[big.clone()], 42),
+            vec![
+                1973765065063347049,
+                7228795623794764364,
+                -8959994473701255385,
+                -7152434883395826761,
+                8319282936231715881,
+                -7898411661632158123
+            ]
+        );
+
+        // the per-value path (used for nested types) must agree
+        for (array, expected) in [
+            (&small, create_murmur3_hashes(6, &[small.clone()], 42)),
+            (&big, create_murmur3_hashes(6, &[big.clone()], 42)),
+        ] {
+            for (i, expected) in expected.into_iter().enumerate() {
+                let mut hash = 42;
+                hash_one(array, i, &mut hash, |data: &[u8], seed: i32| {
+                    spark_compatible_murmur3_hash(data, seed)
+                });
+                assert_eq!(hash, expected);
+            }
+        }
     }
 
     #[test]

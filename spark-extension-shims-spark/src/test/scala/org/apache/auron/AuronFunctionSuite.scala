@@ -95,6 +95,33 @@ class AuronFunctionSuite extends AuronQueryTest with BaseAuronSQLSuite {
     }
   }
 
+  test("hash and xxhash64 of decimal columns") {
+    withTable("t1") {
+      sql("""
+          |create table t1 using parquet as
+          |select
+          |  cast(s as decimal(5, 2)) as small,
+          |  cast(b as decimal(25, 2)) as big,
+          |  array(cast(s as decimal(5, 2))) as small_arr,
+          |  array(cast(b as decimal(25, 2))) as big_arr
+          |from values
+          |  ('1.23', '1.23'),
+          |  ('-5.00', '-5.00'),
+          |  ('0', '0'),
+          |  ('999.99', '12345678901234567890123.45'),
+          |  ('-999.99', '-12345678901234567890123.45'),
+          |  ('1.28', '-1.28'),
+          |  (null, null) as v(s, b)
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("""
+          |select
+          |  hash(small), hash(big), xxhash64(small), xxhash64(big),
+          |  hash(small_arr), hash(big_arr)
+          |from t1
+          |""".stripMargin)
+    }
+  }
+
   test("flatten function with mixed child array nullability") {
     withTable("t1") {
       sql("""
