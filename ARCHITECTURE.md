@@ -15,377 +15,445 @@
 - limitations under the License.
 -->
 
-# Apache Auron Deep Dive: Shuffle, Memory Management, and the Road to Production
+# Apache Auron Deep Dive: Shuffle, Memory, and the Road to Production
 
-Auron accelerates Apache Spark (and Flink) by running physical operators in a native Rust
-engine built on Apache Arrow and DataFusion. This document explains how three subsystems work
-together in that engine: shuffle write, shuffle read, and memory management. It ends with a
-plan for making Auron production ready.
+This guide explains how Auron moves data between stages (shuffle) and how it
+manages memory, two areas where Auron's native engine has to cooperate closely
+with Spark. It ends with a plan for making Auron production ready.
 
-**Audience:** contributors and platform engineers who need to debug, tune, or extend Auron.
+Each section explains the idea in plain language first. Class and file names
+appear only in the **Where to look** table at the end of each section.
 
 **Contents**
 
-1. [Execution model in brief](#1-execution-model-in-brief)
-2. [Shuffle write](#2-shuffle-write)
-3. [Shuffle read](#3-shuffle-read)
+1. [Auron in one page](#1-auron-in-one-page)
+2. [Shuffle write: how map tasks produce output](#2-shuffle-write-how-map-tasks-produce-output)
+3. [Shuffle read: how reduce tasks consume it](#3-shuffle-read-how-reduce-tasks-consume-it)
 4. [Memory management](#4-memory-management)
-5. [Configuration and tuning](#5-configuration-and-tuning)
-6. [Observability and troubleshooting](#6-observability-and-troubleshooting)
-7. [Known limitations and risks](#7-known-limitations-and-risks)
+5. [Configuring and tuning](#5-configuring-and-tuning)
+6. [Troubleshooting](#6-troubleshooting)
+7. [Known risks](#7-known-risks)
 8. [Roadmap to production readiness](#8-roadmap-to-production-readiness)
 
 ---
 
-## 1. Execution model in brief
+## 1. Auron in One Page
 
-Here is what happens to a Spark query:
+Auron makes Spark SQL faster by running the heavy parts of a query in a
+**native engine** written in Rust, built on Apache Arrow and DataFusion,
+instead of in the JVM. Spark still plans the query, schedules tasks, and
+handles failures. Auron replaces the work done *inside* each task.
 
-1. `AuronSparkSessionExtension` adds planner rules. `AuronConvertStrategy` tags each physical
-   node as convertible or not and records why a node can't be converted
-   (`auron.never.convert.reason`).
-2. Convertible subtrees are rewritten as `Native*Exec` nodes and serialized into a protobuf
-   `PhysicalPlanNode`.
-3. On the executor, each task calls into Rust over JNI. The native side
-   ([rt.rs](native-engine/auron/src/rt.rs)) builds a dedicated **Tokio runtime per task**,
-   with threads named `auron-native-stage-<s>-part-<p>-tid-<t>`. It then executes the
-   DataFusion plan and streams Arrow batches back through the Arrow C data interface (FFI).
-4. If a subtree can't be converted, it runs in the JVM. Data moves into native code through
-   `ConvertToNativeExec` (rows to Arrow) and back out through Spark's columnar-to-row path.
-   Each crossing costs CPU and memory.
+Here's what happens to a query:
 
-Shuffle and memory management are the two places where the native engine has to cooperate most
-closely with Spark's own runtime. The rest of this document covers them.
+1. **Planning.** Auron adds rules to Spark's planner. For each operator, Auron
+   decides whether it can run natively. If it can't, Auron records why (for
+   example, "unsupported expression").
+2. **Conversion.** Operators that can run natively are replaced with native
+   versions. The native part of the plan is serialized and sent along with
+   each task.
+3. **Execution.** On the executor, each task calls into the Rust engine through
+   JNI. Each task gets its own small thread pool (a Tokio runtime). Results flow
+   back as Arrow columnar batches.
+4. **Fallback.** Any part that can't run natively stays in the JVM. Data is
+   converted between Spark rows and Arrow columns at each boundary, and every
+   conversion costs CPU and memory.
 
----
+### Key Terms
 
-## 2. Shuffle write
-
-### 2.1 Entry point
-
-To use Auron shuffle, set `spark.shuffle.manager` to
-[AuronShuffleManager](spark-extension-shims-spark/src/main/scala/org/apache/spark/sql/execution/auron/shuffle/AuronShuffleManager.scala).
-The manager wraps Spark's `SortShuffleManager`, reuses its `IndexShuffleBlockResolver`, and
-falls back to it for shuffles that aren't native. For remote shuffle services, use the
-subclasses of `AuronRssShuffleManagerBase`:
-
-| Shuffle backend | Manager | Native repartitioner |
-| :--- | :--- | :--- |
-| Local disk (default) | `AuronShuffleManager` | `SortShuffleRepartitioner`, `SingleShuffleRepartitioner` |
-| Apache Celeborn 0.5 / 0.6 | `AuronCelebornShuffleManager` (`thirdparty/auron-celeborn-*`) | `RssSortShuffleRepartitioner`, `RssSingleShuffleRepartitioner` |
-| Apache Uniffle | `AuronUniffleShuffleManager` (`thirdparty/auron-uniffle`) | same RSS repartitioners |
-
-When the manager is constructed, it also sets several JVM system properties:
-`spark.memory.offHeap.enabled=false`, `io.netty.maxDirectMemory=0`,
-`io.netty.noPreferDirect=true`, and `io.netty.noUnsafe=true`. The goal is to leave direct
-(off-heap) memory to the native engine. These properties only affect components that read them
-*after* this point, so it's safest to also set them explicitly (see [section 5](#5-configuration-and-tuning)).
-
-### 2.2 Handing the write to native code
-
-For each map task, `getWriter()` returns an
-[AuronShuffleWriter](spark-extension-shims-spark/src/main/scala/org/apache/spark/sql/execution/auron/shuffle/AuronShuffleWriter.scala).
-Instead of writing rows from the JVM, `AuronShuffleWriterBase` builds a `ShuffleWriterExecNode`
-with temporary `.data` and `.index` paths and runs it through `NativeHelper.executeNativePlan`.
-
-### 2.3 Buffering, partitioning, and sorting
-
-[ShuffleWriterExec](native-engine/datafusion-ext-plans/src/shuffle_writer_exec.rs) picks a
-repartitioner. If the shuffle has a single output partition, it uses `SingleShuffleRepartitioner`.
-Otherwise it uses
-[SortShuffleRepartitioner](native-engine/datafusion-ext-plans/src/shuffle/sort_repartitioner.rs).
-
-1. **Staging.** Incoming `RecordBatch`es are appended to
-   [BufferedData](native-engine/datafusion-ext-plans/src/shuffle/buffered_data.rs). Before each
-   insert, the repartitioner reserves `current + 2 × batch_size` from the memory manager, which
-   leaves room for the sort's temporary copy.
-2. **Partition IDs.** Rows get partition IDs from Spark-compatible hash (Murmur3, seed 42),
-   range, or round-robin partitioning. Hashing must match Spark exactly. If it doesn't, rows from native
-   and JVM writers land in different partitions and joins return wrong results (see
-   [section 7](#7-known-limitations-and-risks)).
-3. **Radix sort.** `radix_sort_by_key` groups rows by partition ID. The rows are then
-   interleaved into contiguous per-partition chunks, compressed (IPC + `lz4`/`zstd`), and
-   tracked with offsets.
-
-### 2.4 Spilling and the final merge
-
-* **Spill early.** `SortShuffleRepartitioner` is a spillable `MemConsumer`. After every
-  insert, it checks `mem_used_percent()`, which is its usage divided by its *fair share* (not
-  by total memory). Above **0.8**, it spills on its own. Re-reading a shuffle spill is cheap
-  compared with re-reading a hash-join or aggregation spill, so shuffle buffers give memory
-  back first.
-* **Spill target.** `spill()` drains `BufferedData` into a spill created by `try_new_spill()`.
-  The spill goes to the JVM heap when possible and to a local file otherwise (see
-  [section 4.4](#44-tier-2-spilling-to-the-jvm-heap)).
-* **Merge.** When the task finishes, `shuffle_write()` marks the consumer unspillable. It
-  merges the in-memory data and all spills with `OffsettedMergeIterator`, writing partition by
-  partition into the final `.data` file and recording the offsets in the `.index` file. The JVM
-  then commits both files through `IndexShuffleBlockResolver.writeMetadataFileAndCommit`.
-
-RSS repartitioners don't write local files. They push per-partition chunks to the remote
-service through a JNI-wrapped `RssPartitionWriter`.
+| Term | Meaning |
+|------|---------|
+| Native engine | Auron's Rust execution engine, running inside the executor process but outside the JVM heap. |
+| JNI | The bridge that lets JVM code and Rust code call each other. |
+| Map and reduce side | In a shuffle, map tasks write data partitioned by key, and reduce tasks read one partition each. |
+| Spill | Moving in-memory data somewhere else (the JVM heap or disk) to free memory. |
+| Memory consumer | A native operator that uses a lot of memory and registers with Auron's memory manager, such as a sort, aggregation, join, or shuffle buffer. |
+| Spillable | A consumer that can give memory back by spilling. Some, such as a broadcast hash table, can't. |
+| Fair share | The amount of native memory one spillable consumer is allowed to use right now. |
+| Memory overhead | Executor memory outside the JVM heap (`spark.executor.memoryOverhead`). Auron's native engine lives here. |
 
 ---
 
-## 3. Shuffle read
+## 2. Shuffle Write: How Map Tasks Produce Output
 
-### 3.1 Block abstraction
+### Plugging into Spark
 
-On the reduce side, `getReader()` returns
-[AuronBlockStoreShuffleReader](spark-extension-shims-spark/src/main/scala/org/apache/spark/sql/execution/auron/shuffle/AuronBlockStoreShuffleReader.scala).
-The reader keeps Spark's `ShuffleBlockFetcherIterator`, which handles fetching, retries, and
-`spark.reducer.maxSizeInFlight`. Instead of deserializing rows, `readIpc()` wraps each fetched
-block in a `BlockObject` that exposes one of three access paths:
+Spark lets you replace its shuffle implementation. Auron provides its own
+**shuffle manager**, which you enable with the `spark.shuffle.manager` setting.
+The manager is a thin layer over Spark's standard sort-based shuffle manager. It
+reuses Spark's file layout and bookkeeping, so external shuffle services, block
+fetching, and stage retries keep working. For shuffles that aren't native, it
+hands work back to Spark's standard implementation.
 
-| Access path | When it's used | Native reader |
-| :--- | :--- | :--- |
-| `hasFileSegment` | Local block (same host) | File reader (path + offset + length) |
-| `hasByteBuffer` | Fetched block held in memory | Direct or heap `ByteBuffer` reader |
-| `getChannel` | Streamed remote block | `ReadableByteChannel` reader |
+There are versions for three back ends:
 
-The block iterator is registered with `JniBridge.putResource` under a UUID. The native plan
-refers to it by that UUID.
+| Shuffle back end | How data is stored |
+|------------------|--------------------|
+| Local disk (default) | Each map task writes one data file and one index file on the executor's disk, the same as Spark. |
+| Apache Celeborn 0.5 and 0.6 | Map tasks push partition data to a remote shuffle service. |
+| Apache Uniffle | Map tasks push partition data to a remote shuffle service. |
 
-### 3.2 Native decoding
+When the shuffle manager starts, it also tells Spark and Netty (Spark's
+networking library) to **avoid off-heap (direct) memory**. Auron wants the
+memory outside the heap for its native engine. Because these are JVM system
+properties, they only affect components that read them later, so it's safest to
+also set them yourself (see [section 5](#5-configuring-and-tuning)).
 
-[IpcReaderExec](native-engine/datafusion-ext-plans/src/ipc_reader_exec.rs) gets the iterator
-over JNI. It pulls blocks inside `tokio::task::spawn_blocking`, so JNI and IO calls don't stall
-the async workers, and wraps each block in `IpcCompressionReader` to decompress and decode Arrow
-IPC. Small batches are combined with `coalesce_arrays_unchecked` until they reach
-`spark.auron.suggested.batch.memSize` (8 MiB by default).
+### What a Map Task Does
 
----
+Instead of serializing rows in the JVM, a map task hands the whole job to the
+native engine and tells it where to write the output files. Inside the native
+engine:
 
-## 4. Memory management
+1. **Buffer.** Incoming batches are collected in memory. Before adding a batch,
+   the writer reserves twice its size from the memory manager, which leaves
+   room for the temporary copy made while sorting.
+2. **Assign partitions.** Each row is assigned a target partition, using the
+   same hash function Spark uses (Murmur3 with seed 42), or range or round-robin
+   partitioning. The hash has to match Spark's **bit for bit**. If it doesn't,
+   rows written by native tasks and by JVM tasks land in different partitions
+   and joins silently return wrong results.
+3. **Group by partition.** Rows are sorted by partition number with a fast radix
+   sort, so each partition's rows are next to each other. Each partition's
+   chunk is then compressed (lz4 or zstd).
+4. **Spill when needed.** If the buffer grows too large, it's written out as a
+   spill (see below) and buffering starts again.
+5. **Merge and commit.** When the input is finished, the in-memory data and all
+   spills are merged partition by partition into one final data file. An index
+   file records where each partition starts. The JVM then commits both files
+   through Spark's normal mechanism, so the rest of Spark sees an ordinary
+   shuffle output.
 
-Native memory is managed by
-[auron-memmgr](native-engine/auron-memmgr/src/lib.rs). It has three tiers:
-**native memory → JVM heap (on-heap spill) → disk**.
+With a remote shuffle service, steps 1–4 are the same, but chunks are pushed to
+the service instead of written to local files.
 
-### 4.1 Sizing the native pool
+### Why Shuffle Spills Early
 
-[NativeHelper](spark-extension/src/main/scala/org/apache/spark/sql/auron/NativeHelper.scala)
-computes the native pool size on the executor:
+The shuffle writer spills **on its own** once it reaches **80% of its fair
+share** of memory, without waiting for the memory manager to force it. Shuffle
+data is cheap to spill: it's written once and read back once, in order. A
+hash join or aggregation, by contrast, has to re-read and rebuild its spilled
+state. By giving memory back first, shuffle buffers leave more room for the
+operators that need it most.
 
-```
-totalMemory     = spark.executor.memory + spark.executor.memoryOverhead
-                  (overhead defaults to max(0.10 * executorMemory, 384 MiB) if unset)
-nativeMemory    = totalMemory - Runtime.getRuntime().maxMemory()      # roughly the overhead
-MemManager.total = nativeMemory * spark.auron.memoryFraction          # default 0.6
-```
+### Where to look
 
-`MemManager::init` is called once per executor process in
-[exec.rs](native-engine/auron/src/exec.rs). All tasks in that executor share the pool.
-
-### 4.2 Consumers and fair share
-
-Memory-heavy operators (sort, aggregation, joins, shuffle repartitioners, window, and so on)
-implement `MemConsumer` and register as either **spillable** or **unspillable**. Whenever a
-consumer's usage changes, `update_consumer_mem_used_with_custom_updater` recomputes its limits:
-
-```
-total_managed    = MemManager.total - jvm_direct_used - mem_unspillable
-consumer_mem_max = total_managed / num_spillables
-consumer_mem_min = consumer_mem_max / 8
-mem_proc_max     = totalMemory * spark.auron.process.vmrss.memoryFraction   # default 0.9
-```
-
-`jvm_direct_used` comes from `JniBridge.getDirectMemoryUsed()`. Process RSS is read from
-`/proc/self/status` (VmRSS) through `procfs`.
-
-### 4.3 Tier 1: wait or spill
-
-The manager takes action only if **all** of the following are true:
-
-* the consumer is growing (`new_used > old_used`),
-* the consumer uses more than `MIN_TRIGGER_SIZE` (16 MiB), and
-* at least one overflow condition holds: `total_used > total_managed`,
-  `new_used > consumer_mem_max`, or `process RSS > mem_proc_max`.
-
-When it does act, there are two cases:
-
-| Condition | Action |
-| :--- | :--- |
-| Consumer is spillable and `new_used > consumer_mem_min` | **Spill** this consumer right away. |
-| Otherwise (small or unspillable consumer) | **Wait** on a condition variable for up to 10 s for other consumers to free memory. If the wait times out, spill anyway. |
-
-The minimum (1/8 of the fair share) keeps a small consumer from spilling over and over just
-because a large neighbor is using the shared budget.
-
-### 4.4 Tier 2: spilling to the JVM heap
-
-[try_new_spill](native-engine/auron-memmgr/src/spill.rs) asks the JVM whether it has heap to
-spare by calling `AuronOnHeapSpillManager.isOnHeapAvailable()`. The answer comes from
-[SparkOnHeapSpillManager](spark-extension/src/main/scala/org/apache/spark/sql/auron/memory/SparkOnHeapSpillManager.scala),
-and it's yes only when **both** of these ratios are below
-`spark.auron.onHeapSpill.memoryFraction` (default 0.9):
-
-* Spark's on-heap execution pool usage: `used / (used + free)`
-* JVM committed heap usage: `(Runtime.totalMemory - Runtime.freeMemory) / Runtime.totalMemory`
-
-If heap is available, the native buffers are copied into JVM `ByteBuffer`s (`OnHeapSpill`)
-and no disk IO happens. If not, the data goes to a temporary file (`FileSpill`) in one of
-Spark's local directories. On the driver, where there's no task context, spills always go to a
-file.
-
-### 4.5 Tier 3: Spark evicts heap spills to disk
-
-`SparkOnHeapSpillManager` is a regular Spark `MemoryConsumer` in `MemoryMode.ON_HEAP`. When
-another consumer in the task needs heap, `TaskMemoryManager` calls `spill(size, trigger)`. The
-manager then writes its largest on-heap spills to disk through `BlockManager` until it has
-freed enough memory. Because of this, data that native code parks on the heap can't cause a
-JVM OOM. In the worst case, it becomes a disk write.
-
-### 4.6 Summary
-
-| Tier | Owner | Trigger | Cost |
-| :--- | :--- | :--- | :--- |
-| Native memory | `MemManager` | Default | None |
-| JVM heap | `SparkOnHeapSpillManager` | Native spill while heap usage < 90% | One memcpy plus GC pressure |
-| Disk | `FileSpill` / `BlockManager` | Heap busy, or Spark evicts | Compression plus disk IO |
+| Topic | Location |
+|-------|----------|
+| Shuffle manager | `spark-extension-shims-spark/.../shuffle/AuronShuffleManager.scala` |
+| Remote shuffle managers | `thirdparty/auron-celeborn-*`, `thirdparty/auron-uniffle` |
+| Map-side entry (JVM) | `AuronShuffleWriter.scala`, `AuronShuffleWriterBase` |
+| Native writer | `native-engine/datafusion-ext-plans/src/shuffle_writer_exec.rs` |
+| Buffering, sorting, spilling | `native-engine/datafusion-ext-plans/src/shuffle/` (`sort_repartitioner.rs`, `buffered_data.rs`) |
 
 ---
 
-## 5. Configuration and tuning
+## 3. Shuffle Read: How Reduce Tasks Consume It
 
-### 5.1 Minimal production configuration
+### Fetching Stays in Spark
 
-```properties
-spark.sql.extensions            org.apache.spark.sql.auron.AuronSparkSessionExtension
-spark.shuffle.manager           org.apache.spark.sql.execution.auron.shuffle.AuronShuffleManager
-spark.auron.enable              true
+On the reduce side, Auron keeps Spark's own block fetcher, which handles
+finding blocks, fetching them over the network, retrying, and limiting how much
+data is in flight. Auron changes what happens *after* a block arrives: instead
+of turning it back into JVM rows, Auron hands the raw bytes to the native
+engine.
 
-# Memory: give native execution an explicit budget
-spark.executor.memory           8g
-spark.executor.memoryOverhead   6g
-spark.memory.offHeap.enabled    false
-```
+Each fetched block arrives in one of three forms, and the native engine has a
+reader for each:
 
-### 5.2 Key settings
+| Block form | When it happens |
+|------------|-----------------|
+| A slice of a local file | The block lives on the same machine. It's read straight from disk. |
+| A memory buffer | The block was fetched and is held in memory. |
+| A network stream | A remote block is streamed in. |
 
-| Setting | Default | Guidance |
-| :--- | :--- | :--- |
-| `spark.executor.memoryOverhead` | `max(10% heap, 384 MiB)` | **Set it explicitly.** This is the native budget. Start at 50–100% of the heap for join- or aggregation-heavy jobs. |
-| `spark.auron.memoryFraction` | `0.6` | Fraction of overhead that `MemManager` manages. The rest covers allocator fragmentation, Arrow FFI buffers, and Netty. |
-| `spark.auron.process.vmrss.memoryFraction` | `0.9` | Start spilling when process RSS passes this fraction of heap + overhead. Lower it if YARN or Kubernetes kills containers. |
-| `spark.auron.onHeapSpill.memoryFraction` | `0.9` | Upper limit on heap usage for on-heap spills. Lower it if GC time increases while jobs spill. |
-| `spark.auron.suggested.batch.memSize` | `8 MiB` | Target batch size. Larger batches are faster per row but use more peak memory. |
-| `spark.auron.tokio.worker.threads.per.cpu` | `0` (auto) | `0` lets Tokio use **all host cores per task runtime**. On executors that run many tasks, set it to `1` so the thread count matches `spark.task.cpus`. |
-| `spark.memory.offHeap.enabled` | forced `false` | Auron owns off-heap memory. Leave this disabled. |
+The JVM puts the list of blocks into a shared registry under a unique ID, and
+the native plan refers to that ID. That's how the native engine finds its
+input without copying anything through the JVM.
 
-### 5.3 Why the overhead default is risky
+### Decoding in the Native Engine
 
-When `memoryOverhead` is unset, `NativeHelper` uses a fixed 10% / 384 MiB formula. It doesn't
-read `spark.executor.memoryOverheadFactor` (Spark 3.3+) or Kubernetes' non-JVM factor, and it
-doesn't subtract `spark.executor.pyspark.memory`. With the default of 10% overhead and a 0.6
-fraction, an 8 GiB executor gets only about 490 MiB of managed native memory. Native operators
-then spill constantly, or the process RSS goes past the container limit.
+The native reader pulls blocks one at a time. It does this on a separate
+blocking thread so that waiting on JNI or I/O doesn't stall the engine's other
+work. It decompresses each block, decodes the Arrow data, and combines small
+batches until they reach about 8 MiB (set by `spark.auron.suggested.batch.memSize`).
+Larger batches are processed more efficiently by the operators downstream.
 
----
+### Where to look
 
-## 6. Observability and troubleshooting
-
-| Symptom | Where to look | Likely cause or fix |
-| :--- | :--- | :--- |
-| Container killed by YARN or Kubernetes (exit 137/143) | Executor log: `mem manager spilling ... proc resident:` | RSS above the container limit. Raise `memoryOverhead` or lower `vmrss.memoryFraction`. |
-| Long task times with many spills | Log: `mem manager spilling <consumer>`. Spill metrics in the Auron UI tab. | Native pool too small. Raise overhead or `memoryFraction`. |
-| `timeout waiting for resources` | Executor log (WARN) | Unspillable consumers, such as a broadcast hash map, are holding the pool. Check for broadcast-join size misestimates. |
-| High GC time during spills | GC logs, `current jvm memory usage` log lines | On-heap spill is competing with the JVM. Lower `onHeapSpill.memoryFraction`. |
-| Operators not running natively | Driver log: `convertible=false`, `auron.never.convert.reason`. Auron SQL UI tab. | Unsupported expression or type. File an issue with the reason string. |
-| Too many threads, CPU thrash | `jstack` / `top -H`: `auron-native-stage-*` threads | Set `tokio.worker.threads.per.cpu=1`. |
-
-The [auron-spark-ui](auron-spark-ui) module adds an **Auron** SQL tab and a History Server
-plugin. They show each query's native coverage.
+| Topic | Location |
+|-------|----------|
+| Reduce-side entry (JVM) | `AuronBlockStoreShuffleReader.scala`, `AuronBlockStoreShuffleReaderBase.scala` |
+| Native reader | `native-engine/datafusion-ext-plans/src/ipc_reader_exec.rs` |
+| Decompression | `native-engine/datafusion-ext-commons/src/io/ipc_compression.rs` |
 
 ---
 
-## 7. Known limitations and risks
+## 4. Memory Management
 
-These come from reading the code and from recent fixes:
+### The Big Picture
 
-1. **Hash compatibility is required for correctness.** Native hash partitioning must match
-   Spark's Murmur3 bit for bit. That includes decimals of each precision, NaN, and `-0.0` for
-   float and double. Any difference sends rows to the wrong partition and silently corrupts join
-   and bucketing results when native and JVM writers are mixed.
-2. **Scan pushdown has to be conservative.** Predicate pushdown in ORC and Parquet must never
-   skip a row group that could match. NULL handling in statistics is the classic trap.
-3. **Session semantics.** Time functions (`date_trunc`, casts, `from_utc_timestamp`) must use
-   `spark.sql.session.timeZone`. ANSI mode and overflow behavior must match Spark.
-4. **Memory safety at the FFI and IO edges.** Unsafe code around zero-length reads, Arrow FFI
-   ownership, and JNI global references can crash the executor, which is worse than a failed
-   task.
-5. **Threading defaults.** Each task gets its own Tokio runtime. With auto sizing, an executor
-   running N tasks on a C-core host can create about N×C worker threads.
-6. **Shuffle compression ratio.** Rows are regrouped by partition. Without stable ordering
-   within a partition, the shuffle output may compress worse than vanilla Spark's.
-7. **Fallback cost is invisible to users.** Plans that switch between native and JVM execution
-   repeatedly pay conversion costs and can end up slower than vanilla Spark. Nothing warns about
-   this today.
+The native engine allocates memory directly from the operating system, outside
+the JVM heap. That memory has to fit inside the executor's container
+alongside the JVM, or the cluster manager (YARN or Kubernetes) kills the
+container. Auron handles this with **three tiers**, used in order:
+
+1. **Native memory**, the fastest. Operators work here by default.
+2. **The JVM heap**, used for spills when the heap has room. This avoids disk
+   I/O at the cost of one memory copy.
+3. **Disk**, the slowest, used when neither of the first two has room.
+
+### How Big Is the Native Memory Pool?
+
+Auron sizes its pool from your executor settings:
+
+1. **Total container memory** is the heap (`spark.executor.memory`) plus the
+   overhead (`spark.executor.memoryOverhead`). If you don't set the overhead,
+   Auron assumes Spark's classic default of 10% of the heap, with a minimum of
+   384 MiB.
+2. **Native memory** is whatever's left after the JVM heap. In practice that's
+   about the same as the overhead.
+3. **The managed pool** is 60% of native memory (`spark.auron.memoryFraction`).
+   The remaining 40% is a cushion for allocator fragmentation, Arrow buffers
+   passed between the JVM and Rust, and networking.
+
+The pool is created once per executor and shared by all tasks running in it.
+
+**Example.** An executor with an 8 GiB heap and 6 GiB of overhead has 14 GiB in
+total, about 6 GiB of native memory, and a **managed pool of about 3.6 GiB**.
+
+### Sharing the Pool: Fair Shares
+
+Every memory-heavy native operator registers with the memory manager as a
+**consumer**, either spillable or not. Each time a consumer's usage changes,
+the manager recalculates the limits:
+
+- **Managed space** is the pool, minus direct memory the JVM is using (for
+  example, for networking), minus memory held by unspillable consumers.
+- **Fair share** is the managed space divided evenly among the spillable
+  consumers.
+- **Minimum share** is one-eighth of the fair share.
+- **Process limit** is 90% of the whole container
+  (`spark.auron.process.vmrss.memoryFraction`), checked against the process's
+  actual resident memory as reported by the operating system.
+
+**Example, continued.** With the 3.6 GiB pool, nothing unspillable, and four
+spillable consumers, each gets a fair share of about 900 MiB and a minimum share
+of about 115 MiB. The process limit is 90% of 14 GiB, or about 12.6 GiB.
+
+Checking real process memory, not just Auron's own bookkeeping, matters because
+it catches memory Auron doesn't track directly: allocator overhead, JVM direct
+buffers, and native libraries.
+
+### When the Manager Steps In
+
+The manager does nothing unless a consumer is **growing**, is already using
+more than **16 MiB**, and **one** of these is true:
+
+- all consumers together are over the managed space,
+- this consumer is over its fair share, or
+- the whole process is over its memory limit.
+
+When it does step in, it either spills or waits:
+
+- **Spill.** If the consumer is spillable and above its minimum share, the
+  manager tells it to spill right away.
+- **Wait.** Otherwise (the consumer is small or can't spill), the manager pauses
+  it for up to **10 seconds**, hoping other consumers free memory. If nothing
+  frees up in time, it spills anyway.
+
+The minimum share keeps a small consumer from spilling over and over just
+because a big neighbor is using most of the pool.
+
+### Where Spills Go: Heap First, Then Disk
+
+When a native operator spills, Auron first asks the JVM whether it has spare
+heap. The answer is yes only when **both** of these are below 90%
+(`spark.auron.onHeapSpill.memoryFraction`):
+
+- how full Spark's on-heap execution memory is, and
+- how full the JVM heap is overall.
+
+If the heap has room, the spilled data is copied into JVM byte buffers and no
+disk I/O happens. If not, it's written to a temporary file in Spark's local
+directories. On the driver, spills always go to disk.
+
+### Keeping Heap Spills Safe
+
+Putting native data on the heap could push the JVM toward running out of
+memory. Auron prevents that by registering its heap spills with **Spark's own
+memory manager**, like any other Spark memory user. If another part of the task
+later needs heap memory, Spark asks Auron to free some. Auron then writes its
+largest heap spills to disk until enough memory is freed. In the worst case,
+native data on the heap turns into a disk write. It never causes a JVM
+out-of-memory error.
+
+### Summary
+
+| Tier | Managed by | Used when | Cost |
+|------|-----------|-----------|------|
+| Native memory | Auron's memory manager | Always, first | None |
+| JVM heap | Auron's heap spill manager, inside Spark's memory manager | A native spill happens and the heap is less than 90% full | One memory copy, plus some garbage collection pressure |
+| Disk | Temporary files, or Spark's block manager | The heap is busy, or Spark asks Auron to give heap back | Compression plus disk I/O |
+
+### Where to look
+
+| Topic | Location |
+|-------|----------|
+| Pool sizing | `NativeHelper.scala` (`totalMemory`, `nativeMemory`), `native-engine/auron/src/exec.rs` |
+| Fair share, spill, and wait logic | `native-engine/auron-memmgr/src/lib.rs` |
+| Choosing heap or disk | `native-engine/auron-memmgr/src/spill.rs` |
+| Heap spill manager | `spark-extension/.../memory/SparkOnHeapSpillManager.scala` |
+| Settings | `AuronConfiguration.java`, `SparkAuronConfiguration.java` |
 
 ---
 
-## 8. Roadmap to production readiness
+## 5. Configuring and Tuning
 
-"Production ready" here means an operator can turn Auron on for a large share of a mixed fleet
-and expect:
+### Minimal Setup
 
-1. **Correctness.** Results are identical to vanilla Spark, or the query falls back.
-2. **Stability.** Auron never crashes an executor and never causes more OOM kills than vanilla
-   Spark.
-3. **Predictable performance.** Jobs get faster or stay the same, and regressions are caught
-   before release.
-4. **Operability.** Users can see what ran natively and why, and can turn Auron off per query,
-   operator, or expression.
+| Setting | Value |
+|---------|-------|
+| `spark.sql.extensions` | `org.apache.spark.sql.auron.AuronSparkSessionExtension` |
+| `spark.shuffle.manager` | `org.apache.spark.sql.execution.auron.shuffle.AuronShuffleManager` |
+| `spark.auron.enable` | `true` |
+| `spark.executor.memory` | for example, `8g` |
+| `spark.executor.memoryOverhead` | for example, `6g` (**set this explicitly**) |
+| `spark.memory.offHeap.enabled` | `false` |
 
-The work is split into four phases. Phases 1 and 2 block a general-availability recommendation.
-Phases 3 and 4 make Auron the default.
+### What Each Memory Setting Does
 
-### Phase 1: Correctness parity (blocking)
+| Setting | Default | What it controls, and when to change it |
+|---------|---------|------------------------------------------|
+| `spark.executor.memoryOverhead` | 10% of the heap (minimum 384 MiB) | The native engine's budget. **Always set it.** For join- or aggregation-heavy jobs, start at 50–100% of the heap. |
+| `spark.auron.memoryFraction` | 0.6 | The share of the overhead Auron actively manages. Raise it for more native memory, or lower it if containers are killed even though Auron reports little usage. |
+| `spark.auron.process.vmrss.memoryFraction` | 0.9 | When process memory crosses this share of the container, Auron starts spilling. Lower it if YARN or Kubernetes kills containers. |
+| `spark.auron.onHeapSpill.memoryFraction` | 0.9 | How full the heap may be before spills go to disk instead. Lower it if garbage collection time rises during spills. |
+| `spark.auron.suggested.batch.memSize` | 8 MiB | Target batch size. Bigger batches are faster per row but use more memory at peak. |
+| `spark.auron.tokio.worker.threads.per.cpu` | 0 (automatic) | Threads per task. Automatic means **one thread per host core for every task**. On busy executors, set it to 1. |
 
-| # | Work item | Exit criteria |
-| :--- | :--- | :--- |
-| 1.1 | **Spark-compatible hashing everywhere.** Audit `hash`, `xxhash64`, and shuffle partitioning for every type: decimal (compact and large), float/double (NaN, `-0.0`), nested types, and binary. | Property tests compare native hashes with Spark's `Murmur3Hash` / `XxHash64` for random values of every type. |
-| 1.2 | **Run the Spark SQL test suite natively.** Grow `auron-spark-tests` (Spark 3.1–4.1) and burn down the roughly 120 current `ignore`/`exclude` entries. Track the pass rate for each release. | 95% or more of the relevant Spark SQL suites pass, and every remaining exclusion links to an issue. |
-| 1.3 | **Differential fuzzing.** Run random queries and data on Spark and Spark + Auron and compare results, covering NULLs, extreme decimals, timezones, and ANSI mode. Run it nightly in CI. | Zero unresolved mismatches for 30 consecutive nights. |
-| 1.4 | **Conservative pushdown.** Review ORC and Parquet predicate pushdown for NULLs, NaN, `IN` lists, and type promotion. When unsure, don't prune. | Pushdown test matrix per format, with and without NULL statistics. |
-| 1.5 | **Session semantics.** Session timezone, ANSI mode, `spark.sql.legacy.*` flags, and case sensitivity are passed to native code and respected there. If a semantic isn't supported, the query **falls back** instead of approximating. | The config-sensitivity test suite passes. Unsupported flags trigger fallback with a logged reason. |
+### Why You Should Always Set the Overhead
 
-### Phase 2: Stability and resource safety (blocking)
+If you leave `spark.executor.memoryOverhead` unset, Auron falls back to a
+fixed 10% formula. It doesn't take into account Spark 3.3's
+`memoryOverheadFactor`, Kubernetes' larger default for non-JVM workloads, or
+memory set aside for PySpark.
 
-| # | Work item | Exit criteria |
-| :--- | :--- | :--- |
-| 2.1 | **Memory sizing that works without tuning.** Respect `memoryOverheadFactor`, PySpark memory, and Kubernetes overhead. Warn at startup when the native pool is below a safe minimum, such as 1 GiB. Consider defaulting the overhead to a larger fraction when Auron is enabled. | Default configs on standard benchmarks show no container OOM kills. A startup warning is logged when the pool is under-provisioned. |
-| 2.2 | **Bounded threading.** Default `tokio.worker.threads.per.cpu=1`, sized by `spark.task.cpus`. Bound the `spawn_blocking` pool. | The executor thread count is bounded by `cores × constant`. No regression on TPC-DS. |
-| 2.3 | **Memory-safety hardening.** Run Miri or AddressSanitizer on the IO, FFI, and JNI layers. Audit every `unsafe` block, especially zero-length buffers and FFI release callbacks. Turn panics into Spark task failures with context. | ASan CI job on the native test suite. No `abort()` path from a recoverable error. |
-| 2.4 | **Spill robustness.** Test memory-pressure scenarios: many concurrent consumers, big broadcast maps, skewed partitions, and full disks. Make the 10 s wait timeout configurable and record a metric each time it expires. | Chaos tests with small native budgets finish correctly, slower but without OOM. |
-| 2.5 | **Graceful fallback when native code fails.** Optionally retry a failed native task attempt on the JVM path, for example on panic or unsupported-feature errors. | Behind a config flag. Retry rate is reported in metrics. |
-| 2.6 | **RSS parity.** Run the same correctness and chaos suites on Celeborn and Uniffle, including stage retry and speculative execution. | All RSS backends pass the Phase 1 and 2.4 suites. |
+**Example.** An executor with an 8 GiB heap and no overhead set gets about
+820 MiB of overhead and a managed native pool of only about **490 MiB**. Native
+operators then spill all the time, or the process grows past the container
+limit and is killed.
 
-### Phase 3: Performance predictability
+---
 
-| # | Work item | Exit criteria |
-| :--- | :--- | :--- |
-| 3.1 | **Continuous benchmarks.** Run TPC-DS and TPC-H at SF1000 nightly, comparing against vanilla Spark and the previous release. Results go to `benchmark-results/`. | Dashboard exists, and a regression of 5% or more on any query blocks the release. |
-| 3.2 | **Fallback cost model.** Estimate how many native/JVM transitions a plan has. Skip native execution for subtrees where the conversion overhead outweighs the gain. | No query in TPC-DS is slower than vanilla because of fallback. |
-| 3.3 | **Better shuffle compression.** Keep input order within partitions (stable radix sort). Tune the codec and buffer size defaults. | Shuffle bytes are at most vanilla Spark's on TPC-DS. |
-| 3.4 | **Expression coverage.** Use the `never.convert.reason` statistics from production event logs to rank the missing expressions and types to implement next. | 95% or more of operators in fleet workloads run natively. |
-| 3.5 | **Adaptive memory.** Replace the static `memoryFraction` with feedback from RSS and allocator statistics, for example jemalloc or mimalloc introspection. | Fewer spills at the same RSS envelope. |
+## 6. Troubleshooting
 
-### Phase 4: Operability and rollout
+| Symptom | What to check | Likely fix |
+|---------|---------------|------------|
+| Container killed by YARN or Kubernetes (exit code 137 or 143) | Executor log lines starting with "mem manager spilling" show the process's resident memory | Raise the overhead, or lower `spark.auron.process.vmrss.memoryFraction`. |
+| Tasks are slow and spill constantly | Repeated "mem manager spilling" lines, and spill metrics in the Auron tab of the Spark UI | The native pool is too small. Raise the overhead or `spark.auron.memoryFraction`. |
+| Warning "timeout waiting for resources" | Executor log | Memory is tied up by something that can't spill, often a broadcast hash table that's bigger than expected. Check broadcast join size estimates. |
+| Garbage collection time rises during spills | GC logs, and log lines starting with "current jvm memory usage" | Heap spills are competing with the JVM. Lower `spark.auron.onHeapSpill.memoryFraction`. |
+| Operators aren't running natively | Driver log lines showing "convertible=false" and the reason, and the Auron tab of the SQL UI | An unsupported expression or type. Report the reason string. |
+| Too many threads, CPU thrashing | Thread dumps show many threads named "auron-native-stage-…" | Set `spark.auron.tokio.worker.threads.per.cpu` to 1. |
 
-| # | Work item | Exit criteria |
-| :--- | :--- | :--- |
-| 4.1 | **Metrics.** Export native metrics to Spark's metrics system and the event log: spill bytes per tier, wait timeouts, native pool peak, RSS peak, fallback count, and conversion time. | Metrics appear in the Spark UI, the History Server, and Prometheus or Dropwizard sinks. |
-| 4.2 | **Fine-grained kill switches.** About 30 `spark.auron.enable.*` operator flags exist already. Document them, add a deny-list config for expressions, and make sure every flag is honored at runtime. | A runbook can disable any operator without a rebuild. |
-| 4.3 | **Fallback explainability.** Add an `EXPLAIN AURON` style report and a per-query native coverage percentage in the UI. | Users can find out why a query didn't accelerate without reading logs. |
-| 4.4 | **Rollout playbook.** Shadow mode (run both, compare checksums on a sample), canary by queue or tenant, automatic disable on mismatch or OOM spike. | The playbook is documented and tried on at least one large workload. |
-| 4.5 | **Compatibility and release policy.** Publish a support matrix (Spark, Scala, JDK, OS, glibc), a deprecation policy, and a backport policy for correctness fixes. | Matrix appears in the README and is enforced by CI. |
+The Auron UI module adds an **Auron** tab to the Spark SQL UI and a History
+Server plugin. They show how much of each query ran natively.
 
-### Suggested sequencing
+---
+
+## 7. Known Risks
+
+These risks come from reading the code and from recent bug fixes:
+
+1. **Hashing must match Spark exactly.** That includes decimals of every
+   precision, NaN, and negative zero for floats and doubles. Any difference
+   sends rows to the wrong partition and silently corrupts join and bucketing
+   results when native and JVM tasks are mixed.
+2. **Scan filters must be conservative.** When skipping parts of ORC or Parquet
+   files based on their statistics, Auron must never skip data that could
+   match. Handling of NULLs in statistics is the classic mistake.
+3. **Session settings must be respected.** Date and time functions must use the
+   session time zone, and ANSI mode and overflow behavior must match Spark.
+4. **Memory-safety bugs crash the executor.** Unsafe code at the edges (empty
+   reads, buffers passed between the JVM and Rust, JNI references) can bring
+   down the whole executor instead of failing a single task.
+5. **Too many threads by default.** Each task gets its own thread pool. With
+   automatic sizing, an executor running N tasks on a C-core machine can start
+   about N × C threads.
+6. **Weaker shuffle compression.** Rows are regrouped by partition. If their
+   original order isn't preserved, the data may compress worse than with
+   standard Spark.
+7. **Fallback cost is invisible.** A plan that switches between native and JVM
+   execution many times pays for each conversion and can end up slower than
+   standard Spark. Nothing warns the user.
+
+---
+
+## 8. Roadmap to Production Readiness
+
+### What "Production Ready" Means
+
+Operators can turn Auron on across a large share of a mixed fleet and expect:
+
+1. **Correct results**, identical to standard Spark. If Auron can't guarantee
+   that, the query falls back to Spark.
+2. **Stability.** Auron never crashes an executor and never causes more
+   out-of-memory kills than standard Spark.
+3. **Predictable performance.** Jobs get faster or stay the same, and
+   regressions are caught before release.
+4. **Operability.** Users can see what ran natively and why, and can turn Auron
+   off per query, operator, or expression.
+
+Phases 1 and 2 must be done before recommending Auron for general use. Phases 3
+and 4 make it the default.
+
+### Phase 1: Correctness (blocking)
+
+| Work | Done when |
+|------|-----------|
+| **Spark-compatible hashing everywhere.** Check `hash`, `xxhash64`, and shuffle partitioning for every data type, including all decimal sizes, NaN and negative zero, nested types, and binary. | Automated tests compare native hashes with Spark's for random values of every type. |
+| **Run Spark's own SQL tests natively.** Expand the Spark test module (Spark 3.1 to 4.1) and work through the roughly 120 tests currently excluded. | At least 95% of relevant Spark SQL test suites pass, and every remaining exclusion links to an issue. |
+| **Compare against Spark automatically.** Run random queries on random data with both standard Spark and Spark + Auron every night, and compare results. Cover NULLs, extreme decimals, time zones, and ANSI mode. | 30 consecutive nights with no unexplained mismatch. |
+| **Safe file skipping.** Review ORC and Parquet filter pushdown for NULLs, NaN, `IN` lists, and type changes. When unsure, don't skip. | A test matrix for each format, with and without NULL statistics. |
+| **Respect session settings.** Pass the session time zone, ANSI mode, legacy compatibility flags, and case sensitivity to the native engine. If a setting isn't supported, fall back to Spark instead of guessing. | Unsupported settings trigger a fallback with a logged reason. |
+
+### Phase 2: Stability (blocking)
+
+| Work | Done when |
+|------|-----------|
+| **Memory sizing that works without tuning.** Take Spark's overhead factor, Kubernetes defaults, and PySpark memory into account. Warn at startup if the native pool is under 1 GiB. | Benchmarks at default settings show no container killed for memory, and a warning appears when the pool is too small. |
+| **Bounded threads.** Default to one thread per task CPU, and limit the blocking-thread pool. | Thread count per executor is proportional to its cores, with no TPC-DS slowdown. |
+| **Memory-safety checks.** Run the native tests under AddressSanitizer, review every unsafe block at the JVM, Rust, and I/O boundaries, and turn panics into ordinary task failures with context. | An AddressSanitizer CI job, and no recoverable error that aborts the process. |
+| **Spill stress tests.** Many concurrent consumers, oversized broadcast tables, skewed partitions, and full disks. Make the 10-second wait configurable and count timeouts. | Jobs with tiny native budgets finish correctly, just slower. |
+| **Retry on the JVM.** Optionally retry a task that failed in the native engine using the standard JVM path. | Available behind a setting, with the retry rate reported in metrics. |
+| **Remote shuffle parity.** Run the same tests on Celeborn and Uniffle, including stage retries and speculative tasks. | All remote shuffle back ends pass the correctness and stress suites. |
+
+### Phase 3: Performance
+
+| Work | Done when |
+|------|-----------|
+| **Nightly benchmarks.** TPC-DS and TPC-H at scale factor 1000, compared with standard Spark and with the previous release. | A dashboard exists, and a slowdown of 5% or more on any query blocks the release. |
+| **Fallback cost model.** Estimate how many native/JVM switches a plan needs, and keep a section in the JVM when switching would cost more than it saves. | No TPC-DS query is slower than standard Spark because of fallback. |
+| **Better shuffle compression.** Keep the original row order within each partition, and tune the compression defaults. | Shuffle size is no larger than standard Spark's on TPC-DS. |
+| **More native coverage.** Use the fallback reasons recorded in production to decide which expressions and types to add next. | At least 95% of operators in fleet workloads run natively. |
+| **Adaptive memory.** Replace the fixed 60% fraction with feedback from actual process and allocator memory use. | Fewer spills with the same container size. |
+
+### Phase 4: Operability
+
+| Work | Done when |
+|------|-----------|
+| **Metrics.** Export native metrics to Spark's metrics system and event log: spill bytes per tier, wait timeouts, peak native memory, peak process memory, fallback counts, and conversion time. | Metrics appear in the Spark UI, the History Server, and Prometheus or Dropwizard. |
+| **Fine-grained off switches.** About 30 per-operator enable settings already exist. Document them, add a block list for individual expressions, and make sure each one is honored at runtime. | Any operator can be turned off from a runbook without a rebuild. |
+| **Explain fallback.** A per-query report of what ran natively, what didn't, and why, plus a native coverage percentage in the UI. | Users can find out why a query wasn't accelerated without reading logs. |
+| **Rollout playbook.** Shadow runs (run both engines and compare checksums on a sample), canaries by queue or tenant, and automatic disable on a mismatch or a spike in memory kills. | Documented and tried on at least one large workload. |
+| **Support policy.** Publish supported Spark, Scala, JDK, and OS versions, plus deprecation and backport rules for correctness fixes. | The support matrix is in the README and checked in CI. |
+
+### Suggested Order
 
 | Quarter | Focus | Milestone |
-| :--- | :--- | :--- |
-| Q1 | 1.1, 1.4, 1.5, 2.1, 2.2 | Fix known correctness and resource bugs. Make default configs safe. |
-| Q2 | 1.2, 1.3, 2.3, 2.4 | Correctness gates in CI. Chaos and ASan suites. **Beta.** |
-| Q3 | 2.5, 2.6, 3.1, 3.2, 4.1 | Benchmark gate, RSS parity, metrics. **GA candidate.** |
-| Q4 | 3.3–3.5, 4.2–4.5 | Performance tuning, rollout tooling. **GA / default-on.** |
+|---------|-------|-----------|
+| Q1 | Hashing, file skipping, session settings, memory sizing, threads | Known correctness and resource bugs fixed. Defaults are safe. |
+| Q2 | Spark SQL tests, nightly comparison, AddressSanitizer, spill stress tests | Correctness checks run in CI. **Beta.** |
+| Q3 | JVM retry, remote shuffle parity, benchmarks, fallback cost model, metrics | Performance gate and metrics in place. **GA candidate.** |
+| Q4 | Compression, coverage, adaptive memory, operability items | **GA, on by default.** |
